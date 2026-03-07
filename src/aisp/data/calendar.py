@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 from datetime import date, timedelta
 
@@ -40,6 +41,8 @@ async def init_trading_calendar() -> int:
 
     trade_date_set = set(trade_dates)
     sorted_dates = sorted(trade_dates)
+    # Build index for O(1) lookup
+    date_to_idx = {d: i for i, d in enumerate(sorted_dates)}
 
     # Generate calendar from earliest trading date to today + 365 days
     start = sorted_dates[0]
@@ -55,21 +58,18 @@ async def init_trading_calendar() -> int:
         next_td = None
 
         if is_trading:
-            idx = sorted_dates.index(current)
+            idx = date_to_idx[current]
             if idx > 0:
                 prev_td = sorted_dates[idx - 1]
             if idx < len(sorted_dates) - 1:
                 next_td = sorted_dates[idx + 1]
         else:
-            # Find nearest prev trading date
-            for d in reversed(sorted_dates):
-                if d < current:
-                    prev_td = d
-                    break
-            for d in sorted_dates:
-                if d > current:
-                    next_td = d
-                    break
+            # Binary search for nearest prev trading date
+            pos = bisect.bisect_left(sorted_dates, current)
+            if pos > 0:
+                prev_td = sorted_dates[pos - 1]
+            if pos < len(sorted_dates):
+                next_td = sorted_dates[pos]
 
         records.append(
             {

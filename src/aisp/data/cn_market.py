@@ -1,37 +1,29 @@
-"""A-share market data fetcher using AkShare."""
+"""A-share market data fetcher.
+
+Individual stock data: BaoStock (TCP socket, bypasses HTTP proxy, fast batch).
+Sector daily data: AkShare stock_board_industry_summary_ths (THS source).
+Sector-stock mapping: pre-populated by scripts/scrape_ths_sectors.py.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
-from datetime import date, datetime
+from datetime import date, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from aisp.data import with_retry
 from aisp.data.calendar import init_trading_calendar
 from aisp.db.engine import get_engine, get_session_factory
-from aisp.db.models import SectorDaily, StkDaily, StkSectorMap
+from aisp.db.models import SectorDaily, StkDaily, TradingCalendar
 
 logger = logging.getLogger(__name__)
 
-# AkShare column name → our model field mappings
-STK_COLUMN_MAP = {
-    "代码": "code",
-    "名称": "name",
-    "今开": "open",
-    "最高": "high",
-    "最低": "low",
-    "最新价": "close",
-    "成交量": "volume",
-    "成交额": "amount",
-    "涨跌幅": "change_pct",
-    "换手率": "turnover_rate",
-    "量比": "volume_ratio",
-    "流通市值": "market_cap",
-}
+
+# ── Pure helper functions ─────────────────────────────────────────
 
 
 def _is_st(name: str) -> bool:
@@ -51,68 +43,255 @@ def _is_limit_down(change_pct: float, name: str) -> bool:
     return change_pct <= -9.9
 
 
-@with_retry(max_retries=3)
-async def _fetch_stock_spot() -> list[dict]:
-    """Fetch all A-share stock spot data."""
+def _safe_float(val) -> float | None:
+    """Convert value to float, returning None for missing/invalid data."""
+    if val is None or val == "-" or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_bs_code(code: str) -> str:
+    """Convert plain code to BaoStock format: 600519 → sh.600519, 000001 → sz.000001."""
+    if code.startswith(("6", "9")):
+        return f"sh.{code}"
+    return f"sz.{code}"
+
+
+def _from_bs_code(bs_code: str) -> str:
+    """Convert BaoStock code to plain code: sh.600519 → 600519."""
+    return bs_code.split(".", 1)[-1] if "." in bs_code else bs_code
+
+
+# ── BaoStock context manager ─────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _bs_login_context():
+    """BaoStock login/logout context manager."""
+    import baostock as bs
+
+    login_result = bs.login()
+    if login_result.error_code != "0":
+        raise RuntimeError(f"BaoStock login failed: {login_result.error_msg}")
+    try:
+        yield bs
+    finally:
+        bs.logout()
+
+
+# ── BaoStock data fetching (synchronous, run in background thread) ──
+
+
+def _fetch_stock_name_map_sync() -> dict[str, str]:
+    """Fetch code→name mapping for all A-share stocks via AkShare.
+
+    Returns: {code: stock_name}
+    """
     import akshare as ak
 
-    def _fetch():
-        df = ak.stock_zh_a_spot_em()
+    try:
+        df = ak.stock_info_a_code_name()
+        if df is not None and not df.empty:
+            return dict(zip(df["code"].astype(str).str.zfill(6), df["name"], strict=False))
+    except Exception:
+        logger.warning("AkShare stock_info_a_code_name failed, falling back to BaoStock")
+
+    # Fallback: BaoStock industry map (for name mapping only)
+    import baostock as bs
+
+    rs = bs.query_stock_industry()
+    if rs.error_code != "0":
+        return {}
+
+    name_map: dict[str, str] = {}
+    while rs.next():
+        row = rs.get_row_data()
+        if len(row) >= 3:
+            code = _from_bs_code(row[1])
+            name_map[code] = row[2]
+    return name_map
+
+
+def _fetch_all_codes_sync() -> list[str]:
+    """Fetch all A-share stock codes via BaoStock industry classification.
+
+    Used for full-market fetch mode.
+    """
+    import baostock as bs
+
+    rs = bs.query_stock_industry()
+    if rs.error_code != "0":
+        logger.error("Failed to query stock industry: %s", rs.error_msg)
+        return []
+
+    codes: list[str] = []
+    while rs.next():
+        row = rs.get_row_data()
+        if len(row) >= 2:
+            codes.append(_from_bs_code(row[1]))
+    return codes
+
+
+def _fetch_stock_daily_sync(
+    codes: list[str],
+    trade_date: date,
+    lookback_days: int = 10,
+) -> list[dict]:
+    """Fetch daily K-line data for given codes.
+
+    Queries trade_date minus lookback_days for volume_ratio computation.
+    Returns only records matching trade_date.
+    """
+    import baostock as bs
+
+    start_str = (trade_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end_str = trade_date.strftime("%Y-%m-%d")
+    target_str = end_str
+    fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg,turn,isST"
+
+    results: list[dict] = []
+    total = len(codes)
+
+    for i, code in enumerate(codes):
+        if (i + 1) % 500 == 0:
+            logger.info("Fetching stock data: %d/%d", i + 1, total)
+
+        bs_code = _to_bs_code(code)
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields,
+                start_date=start_str,
+                end_date=end_str,
+                frequency="d",
+                adjustflag="3",  # 不复权
+            )
+            if rs.error_code != "0":
+                continue
+
+            rows: list[list[str]] = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+
+            if not rows:
+                continue
+
+            # Separate today vs previous days for volume_ratio
+            today_row = None
+            prev_volumes: list[float] = []
+            for row in rows:
+                if row[0] == target_str:
+                    today_row = row
+                else:
+                    vol = _safe_float(row[7])
+                    if vol is not None and vol > 0:
+                        prev_volumes.append(vol)
+
+            if today_row is None:
+                continue
+
+            today_vol = _safe_float(today_row[7])
+            volume_ratio = None
+            if today_vol and prev_volumes:
+                recent = prev_volumes[-5:]
+                avg_vol = sum(recent) / len(recent)
+                if avg_vol > 0:
+                    volume_ratio = today_vol / avg_vol
+
+            change_pct = _safe_float(today_row[9]) or 0.0
+            is_st_flag = today_row[11] == "1" if len(today_row) > 11 else False
+            st_name = "ST" if is_st_flag else ""
+
+            results.append({
+                "code": _from_bs_code(today_row[1]),
+                "name": "",  # filled later from industry_map
+                "open": _safe_float(today_row[2]) or 0.0,
+                "high": _safe_float(today_row[3]) or 0.0,
+                "low": _safe_float(today_row[4]) or 0.0,
+                "close": _safe_float(today_row[5]) or 0.0,
+                "volume": _safe_float(today_row[7]) or 0.0,
+                "amount": _safe_float(today_row[8]) or 0.0,
+                "change_pct": change_pct,
+                "turnover_rate": _safe_float(today_row[10]),
+                "volume_ratio": volume_ratio,
+                "net_inflow": None,  # BaoStock 不提供资金流数据
+                "market_cap": None,  # 日线不含市值
+                "is_st": is_st_flag,
+                "is_limit_up": _is_limit_up(change_pct, st_name),
+                "is_limit_down": _is_limit_down(change_pct, st_name),
+            })
+        except Exception:
+            logger.debug("Failed to fetch data for %s", code)
+
+    return results
+
+
+@with_retry(max_retries=2)
+async def _fetch_bs_data(
+    trade_date: date,
+    codes: list[str] | None = None,
+) -> tuple[dict[str, str], list[dict]]:
+    """Run BaoStock queries in a background thread.
+
+    Args:
+        trade_date: Target trading date.
+        codes: If provided, only fetch these stock codes (skip full market scan).
+
+    Returns (name_map, stock_daily_records).
+    """
+
+    def _sync():
+        with _bs_login_context():
+            name_map = _fetch_stock_name_map_sync()
+            fetch_codes = codes if codes is not None else _fetch_all_codes_sync()
+            logger.info(
+                "Name map: %d stocks, fetching %d stocks from BaoStock",
+                len(name_map),
+                len(fetch_codes),
+            )
+            stock_data = _fetch_stock_daily_sync(fetch_codes, trade_date)
+            return name_map, stock_data
+
+    return await asyncio.to_thread(_sync)
+
+
+# ── THS sector daily data ────────────────────────────────────────
+
+
+@with_retry(max_retries=2)
+async def _fetch_ths_sector_daily() -> list[dict]:
+    """Fetch THS industry board daily summary via AkShare.
+
+    Returns list of dicts ready for sector_daily upsert (without trade_date/close/MAs).
+    """
+    import akshare as ak
+
+    def _sync():
+        df = ak.stock_board_industry_summary_ths()
         if df is None or df.empty:
             return []
-        return df.to_dict("records")
 
-    return await asyncio.to_thread(_fetch)
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                "sector_name": row["板块"],
+                "change_pct": float(row["涨跌幅"]),
+                "volume": float(row["总成交量"]),
+                "amount": float(row["总成交额"]),
+                "net_inflow": float(row["净流入"]) if row["净流入"] else None,
+                "stock_count": int(row["上涨家数"]) + int(row["下跌家数"]),
+                "up_count": int(row["上涨家数"]),
+                "down_count": int(row["下跌家数"]),
+            })
+        return results
 
-
-@with_retry(max_retries=3)
-async def _fetch_sector_list() -> list[dict]:
-    """Fetch industry sector ranking."""
-    import akshare as ak
-
-    def _fetch():
-        df = ak.stock_board_industry_name_em()
-        if df is None or df.empty:
-            return []
-        return df.to_dict("records")
-
-    return await asyncio.to_thread(_fetch)
-
-
-@with_retry(max_retries=3)
-async def _fetch_sector_constituents(sector_name: str) -> list[dict]:
-    """Fetch constituent stocks of a sector."""
-    import akshare as ak
-
-    def _fetch():
-        try:
-            df = ak.stock_board_industry_cons_em(symbol=sector_name)
-            if df is None or df.empty:
-                return []
-            return df.to_dict("records")
-        except Exception:
-            logger.warning("Failed to fetch constituents for sector: %s", sector_name)
-            return []
-
-    return await asyncio.to_thread(_fetch)
+    return await asyncio.to_thread(_sync)
 
 
-@with_retry(max_retries=3)
-async def _fetch_fund_flow() -> list[dict]:
-    """Fetch today's main fund flow ranking. Gracefully degrades on failure."""
-    import akshare as ak
-
-    def _fetch():
-        try:
-            df = ak.stock_individual_fund_flow_rank(indicator="今日")
-            if df is None or df.empty:
-                return []
-            return df.to_dict("records")
-        except Exception:
-            logger.warning("Fund flow data not available, degrading gracefully")
-            return []
-
-    return await asyncio.to_thread(_fetch)
+# ── DB upsert helpers (unchanged) ────────────────────────────────
 
 
 async def _upsert_stocks(records: list[dict], trade_date: date) -> int:
@@ -175,24 +354,9 @@ async def _upsert_sectors(records: list[dict]) -> int:
     return len(records)
 
 
-async def _compute_sector_ma(sector_name: str, trade_date: date) -> dict[str, float | None]:
-    """Compute moving averages for a sector from historical data."""
-    engine = get_engine()
-    session_factory = get_session_factory(engine)
-    async with session_factory() as session:
-        result = await session.execute(
-            select(SectorDaily.close)
-            .where(
-                SectorDaily.sector_name == sector_name,
-                SectorDaily.trade_date <= trade_date,
-            )
-            .order_by(SectorDaily.trade_date.desc())
-            .limit(60)
-        )
-        closes = [row[0] for row in result.all()]
-    await engine.dispose()
-
-    mas = {}
+def _compute_ma_from_closes(closes: list[float]) -> dict[str, float | None]:
+    """Compute moving averages from a list of closes (most recent first)."""
+    mas: dict[str, float | None] = {}
     for period, key in [(5, "ma5"), (10, "ma10"), (20, "ma20"), (60, "ma60")]:
         if len(closes) >= period:
             mas[key] = sum(closes[:period]) / period
@@ -201,87 +365,63 @@ async def _compute_sector_ma(sector_name: str, trade_date: date) -> dict[str, fl
     return mas
 
 
-async def _update_sector_maps(sector_constituents: dict[str, list[dict]]) -> int:
-    """Update stk_sector_map with current sector memberships."""
-    if not sector_constituents:
-        return 0
-
+async def _compute_and_update_sector_mas(
+    sector_names: list[str], trade_date: date
+) -> None:
+    """Compute and update moving averages for all sectors in a single session."""
     engine = get_engine()
     session_factory = get_session_factory(engine)
-    now = datetime.now()
-    count = 0
-
     async with session_factory() as session:
-        for sector_name, constituents in sector_constituents.items():
-            for stock in constituents:
-                code = stock.get("代码", "")
-                if not code:
-                    continue
-
-                rec = {
-                    "code": code,
-                    "sector_name": sector_name,
-                    "source": "ths",
-                    "is_active": True,
-                    "updated_at": now,
-                }
-                stmt = (
-                    sqlite_upsert(StkSectorMap)
-                    .values(**rec)
-                    .on_conflict_do_update(
-                        index_elements=["code", "sector_name", "source"],
-                        set_={"is_active": True, "updated_at": now},
-                    )
+        for sector_name in sector_names:
+            result = await session.execute(
+                select(SectorDaily.close)
+                .where(
+                    SectorDaily.sector_name == sector_name,
+                    SectorDaily.trade_date <= trade_date,
                 )
-                await session.execute(stmt)
-                count += 1
+                .order_by(SectorDaily.trade_date.desc())
+                .limit(60)
+            )
+            closes = [row[0] for row in result.all()]
+            mas = _compute_ma_from_closes(closes)
 
-            # Mark stocks no longer in this sector as inactive
-            active_codes = [s.get("代码", "") for s in constituents if s.get("代码")]
-            if active_codes:
-                from sqlalchemy import update
-
+            if any(v is not None for v in mas.values()):
                 await session.execute(
-                    update(StkSectorMap)
+                    update(SectorDaily)
                     .where(
-                        StkSectorMap.sector_name == sector_name,
-                        StkSectorMap.source == "ths",
-                        StkSectorMap.code.not_in(active_codes),
+                        SectorDaily.trade_date == trade_date,
+                        SectorDaily.sector_name == sector_name,
                     )
-                    .values(is_active=False, updated_at=now)
+                    .values(**mas)
                 )
-
         await session.commit()
     await engine.dispose()
-    return count
 
 
-async def fetch_cn_market(trade_date: date | None = None) -> dict:
-    """Fetch A-share market data: stocks, sectors, fund flow, calendar.
+# ── Main entry point ─────────────────────────────────────────────
+
+
+async def fetch_cn_market(
+    trade_date: date | None = None,
+    *,
+    codes: list[str] | None = None,
+) -> dict:
+    """Fetch A-share market data.
+
+    Individual stocks: BaoStock (TCP, fast batch, proxy-immune).
+    Sector daily: AkShare stock_board_industry_summary_ths (THS source).
+
+    Args:
+        trade_date: Target date, defaults to today.
+        codes: If provided, only fetch these stock codes instead of full market.
 
     Returns a summary dict with counts.
     """
     target_date = trade_date or date.today()
-    result = {"stocks": 0, "sectors": 0, "sector_maps": 0, "calendar": 0}
+    result = {"stocks": 0, "sectors": 0, "calendar": 0}
 
-    # 1. Initialize trading calendar (first run only if empty)
+    # 1. Ensure trading calendar is populated
     logger.info("Checking trading calendar...")
-    engine = get_engine()
-    session_factory = get_session_factory(engine)
-    async with session_factory() as session:
-        await session.scalar(
-            select(func.count()).select_from(
-                select(1)
-                .select_from(StkDaily)
-                .limit(1)
-                .correlate(None)
-                .subquery()
-            )
-        )
-    await engine.dispose()
-
-    # Always ensure calendar is populated
-    from aisp.db.models import TradingCalendar
     engine = get_engine()
     session_factory = get_session_factory(engine)
     async with session_factory() as session:
@@ -294,143 +434,87 @@ async def fetch_cn_market(trade_date: date | None = None) -> dict:
         logger.info("Initializing trading calendar...")
         result["calendar"] = await init_trading_calendar()
 
-    # 2. Fetch stock spot data
-    logger.info("Fetching A-share stock data...")
-    spot_data = await _fetch_stock_spot()
+    # 2. Fetch individual stock data from BaoStock
+    mode_label = f"{len(codes)} codes" if codes else "full market"
+    logger.info("Fetching A-share stock data from BaoStock (%s)...", mode_label)
+    name_map, stock_data = await _fetch_bs_data(target_date, codes=codes)
 
-    # 3. Fetch fund flow (best-effort)
-    logger.info("Fetching fund flow data...")
-    fund_flow_data = await _fetch_fund_flow()
-    fund_flow_map: dict[str, float] = {}
-    for row in fund_flow_data:
-        code = row.get("代码", "")
-        inflow = row.get("主力净流入-净额")
-        if code and inflow is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                fund_flow_map[code] = float(inflow)
+    if not name_map:
+        logger.warning("No stock name map available, stock names may be empty")
 
-    # 4. Transform and upsert stock records
     stock_records: list[dict] = []
-    for row in spot_data:
-        try:
-            code = str(row.get("代码", ""))
-            name = str(row.get("名称", ""))
-            if not code or not name:
-                continue
+    for rec in stock_data:
+        code = rec["code"]
+        name = name_map.get(code, "")
 
-            close_val = row.get("最新价")
-            if close_val is None or close_val == "-":
-                continue
+        close = rec["close"]
+        if not close or close <= 0:
+            continue
 
-            change_pct = float(row.get("涨跌幅", 0) or 0)
-
-            stock_records.append(
-                {
-                    "trade_date": target_date,
-                    "code": code,
-                    "name": name,
-                    "open": float(row.get("今开", 0) or 0),
-                    "high": float(row.get("最高", 0) or 0),
-                    "low": float(row.get("最低", 0) or 0),
-                    "close": float(close_val),
-                    "volume": float(row.get("成交量", 0) or 0),
-                    "amount": float(row.get("成交额", 0) or 0),
-                    "change_pct": change_pct,
-                    "turnover_rate": _safe_float(row.get("换手率")),
-                    "volume_ratio": _safe_float(row.get("量比")),
-                    "net_inflow": fund_flow_map.get(code),
-                    "market_cap": _safe_float(row.get("流通市值")),
-                    "is_st": _is_st(name),
-                    "is_limit_up": _is_limit_up(change_pct, name),
-                    "is_limit_down": _is_limit_down(change_pct, name),
-                }
-            )
-        except Exception:
-            logger.exception("Error processing stock row: %s", row.get("代码"))
+        rec["name"] = name
+        if not rec["is_st"]:
+            rec["is_st"] = _is_st(name)
+        rec["is_limit_up"] = _is_limit_up(rec["change_pct"], name)
+        rec["is_limit_down"] = _is_limit_down(rec["change_pct"], name)
+        rec["trade_date"] = target_date
+        stock_records.append(rec)
 
     result["stocks"] = await _upsert_stocks(stock_records, target_date)
     logger.info("Upserted %d stock records", result["stocks"])
 
-    # 5. Fetch sector data
-    logger.info("Fetching sector data...")
-    sector_data = await _fetch_sector_list()
+    # 3. Fetch THS sector daily summary (independent of stock data)
+    logger.info("Fetching THS sector daily summary...")
+    sector_aggregated = await _fetch_ths_sector_daily()
 
-    sector_records: list[dict] = []
     sector_names: list[str] = []
-    for row in sector_data:
-        try:
-            sector_name = str(row.get("板块名称", ""))
-            if not sector_name:
-                continue
-            sector_names.append(sector_name)
-
-            rec = {
-                "trade_date": target_date,
-                "sector_name": sector_name,
-                "close": float(row.get("最新价", 0) or 0),
-                "change_pct": float(row.get("涨跌幅", 0) or 0),
-                "volume": float(row.get("总成交量", 0) or 0),
-                "amount": float(row.get("总成交额", 0) or 0),
-                "net_inflow": _safe_float(row.get("主力净流入")),
-                "stock_count": int(row.get("股票数", 0) or 0),
-                "up_count": int(row.get("上涨家数", 0) or 0),
-                "down_count": int(row.get("下跌家数", 0) or 0),
-                "ma5": None,
-                "ma10": None,
-                "ma20": None,
-                "ma60": None,
-            }
-            sector_records.append(rec)
-        except Exception:
-            logger.exception("Error processing sector row: %s", row.get("板块名称"))
-
-    result["sectors"] = await _upsert_sectors(sector_records)
-    logger.info("Upserted %d sector records", result["sectors"])
-
-    # 6. Compute MAs for sectors (after data is in DB)
-    logger.info("Computing sector moving averages...")
-    engine = get_engine()
-    session_factory = get_session_factory(engine)
-    async with session_factory() as session:
-        for sector_name in sector_names:
-            mas = await _compute_sector_ma(sector_name, target_date)
-            if any(v is not None for v in mas.values()):
-                from sqlalchemy import update
-
-                await session.execute(
-                    update(SectorDaily)
-                    .where(
-                        SectorDaily.trade_date == target_date,
-                        SectorDaily.sector_name == sector_name,
-                    )
-                    .values(**mas)
+    if sector_aggregated:
+        # Compute running sector close from previous DB values
+        engine = get_engine()
+        session_factory = get_session_factory(engine)
+        async with session_factory() as session:
+            subq = (
+                select(
+                    SectorDaily.sector_name,
+                    func.max(SectorDaily.trade_date).label("max_date"),
                 )
-        await session.commit()
-    await engine.dispose()
+                .where(SectorDaily.trade_date < target_date)
+                .group_by(SectorDaily.sector_name)
+                .subquery()
+            )
+            prev_result = await session.execute(
+                select(SectorDaily.sector_name, SectorDaily.close).join(
+                    subq,
+                    (SectorDaily.sector_name == subq.c.sector_name)
+                    & (SectorDaily.trade_date == subq.c.max_date),
+                )
+            )
+            prev_closes = {row[0]: row[1] for row in prev_result.all()}
+        await engine.dispose()
 
-    # 7. Fetch sector constituents (top sectors only to limit API calls)
-    logger.info("Fetching sector constituents...")
-    top_sectors = sector_names[:30]  # Limit to top 30 sectors
-    sector_constituents: dict[str, list[dict]] = {}
-    for sector_name in top_sectors:
-        try:
-            constituents = await _fetch_sector_constituents(sector_name)
-            if constituents:
-                sector_constituents[sector_name] = constituents
-        except Exception:
-            logger.warning("Failed to get constituents for %s", sector_name)
+        sector_records: list[dict] = []
+        for rec in sector_aggregated:
+            sname = rec["sector_name"]
+            sector_names.append(sname)
 
-    result["sector_maps"] = await _update_sector_maps(sector_constituents)
-    logger.info("Updated %d sector mappings", result["sector_maps"])
+            prev = prev_closes.get(sname)
+            if prev and prev > 0:
+                rec["close"] = round(prev * (1 + rec["change_pct"] / 100.0), 2)
+            else:
+                rec["close"] = 1000.0  # Initial value for new sectors
+
+            rec["trade_date"] = target_date
+            rec["ma5"] = None
+            rec["ma10"] = None
+            rec["ma20"] = None
+            rec["ma60"] = None
+            sector_records.append(rec)
+
+        result["sectors"] = await _upsert_sectors(sector_records)
+        logger.info("Upserted %d sector records", result["sectors"])
+
+    # 4. Compute MAs for sectors (after data is in DB)
+    if sector_names:
+        logger.info("Computing sector moving averages...")
+        await _compute_and_update_sector_mas(sector_names, target_date)
 
     return result
-
-
-def _safe_float(val) -> float | None:
-    """Convert value to float, returning None for missing/invalid data."""
-    if val is None or val == "-" or val == "":
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None

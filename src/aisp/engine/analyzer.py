@@ -227,8 +227,11 @@ async def _get_sentiment_context(session, code: str, trade_date: date) -> str:
     return "\n".join(lines)
 
 
-async def run_analysis(trade_date: date) -> int:
+async def run_analysis(trade_date: date, *, btc_metrics=None) -> int:
     """Run full analysis pipeline: sentiment → screening → LLM analysis → signals.
+
+    Args:
+        btc_metrics: Optional BtcRiskMetrics for global context enrichment.
 
     Returns number of signals generated.
     """
@@ -258,6 +261,8 @@ async def run_analysis(trade_date: date) -> int:
         async with session_factory() as session:
             sector_context_cache: dict[str, str] = {}
             global_context = await _get_global_context(session, trade_date)
+            if btc_metrics is not None:
+                global_context += btc_metrics.to_prompt_text()
 
             for stock in scored_stocks:
                 try:

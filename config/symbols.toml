@@ -1,0 +1,123 @@
+# 全球市场标的配置
+#
+# 此文件定义 fetch-us 和 fetch-commodities 命令抓取的标的。
+# 修改后无需重启，下次执行命令时自动生效。
+#
+# asset_type 可选值: index | stock | commodity
+
+# ── 美股指数 ──────────────────────────────────────────────
+
+[[us_market]]
+symbol = "^GSPC"
+name = "S&P 500"
+asset_type = "index"
+
+[[us_market]]
+symbol = "^IXIC"
+name = "Nasdaq Composite"
+asset_type = "index"
+
+[[us_market]]
+symbol = "^DJI"
+name = "Dow Jones"
+asset_type = "index"
+
+# ── 中概 ETF ─────────────────────────────────────────────
+
+[[us_market]]
+symbol = "KWEB"
+name = "KraneShares CSI China Internet ETF"
+asset_type = "stock"
+
+# ── 美股科技龙头 ──────────────────────────────────────────
+
+[[us_market]]
+symbol = "AAPL"
+name = "Apple"
+asset_type = "stock"
+
+[[us_market]]
+symbol = "NVDA"
+name = "NVIDIA"
+asset_type = "stock"
+
+[[us_market]]
+symbol = "MSFT"
+name = "Microsoft"
+asset_type = "stock"
+
+[[us_market]]
+symbol = "TSLA"
+name = "Tesla"
+asset_type = "stock"
+
+[[us_market]]
+symbol = "AMD"
+name = "AMD"
+asset_type = "stock"
+
+# ── 国际大宗商品 (yfinance) ────────────────────────────────
+
+[[yf_commodities]]
+symbol = "GC=F"
+name = "Gold Futures"
+
+[[yf_commodities]]
+symbol = "HG=F"
+name = "Copper Futures"
+
+[[yf_commodities]]
+symbol = "CL=F"
+name = "Crude Oil WTI"
+
+[[yf_commodities]]
+symbol = "SI=F"
+name = "Silver Futures"
+
+# ── 国内大宗商品 (AkShare) ─────────────────────────────────
+# symbol 为 AkShare futures_main_sina 接口的品种名
+# 注意：此接口可能因网络环境不可用，失败时自动降级跳过
+
+[[ak_commodities]]
+symbol = "碳酸锂"
+name = "碳酸锂"
+
+[[ak_commodities]]
+symbol = "铁矿石"
+name = "铁矿石"
+
+# ── A 股自选股 ──────────────────────────────────────────────
+# fetch-cn --mode watchlist 时仅拉取此列表中的股票
+# 板块映射仍从 BaoStock 行业分类获取
+
+[[cn_watchlist]]
+code = "600519"
+name = "贵州茅台"
+
+[[cn_watchlist]]
+code = "000858"
+name = "五粮液"
+
+[[cn_watchlist]]
+code = "601398"
+name = "工商银行"
+
+[[cn_watchlist]]
+code = "600036"
+name = "招商银行"
+
+[[cn_watchlist]]
+code = "002594"
+name = "比亚迪"
+
+[[cn_watchlist]]
+code = "601012"
+name = "隆基绿能"
+
+[[cn_watchlist]]
+code = "002371"
+name = "北方华创"
+
+[[cn_watchlist]]
+code = "603501"
+name = "韦尔股份"

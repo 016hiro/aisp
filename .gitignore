@@ -28,3 +28,5 @@ briefings/
 # OS
 .DS_Store
 Thumbs.db
+logs/
+config/ths_scrape_progress.json

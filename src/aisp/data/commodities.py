@@ -9,24 +9,15 @@ from datetime import date, timedelta
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from aisp.data import with_retry
+from aisp.data.symbols import load_ak_commodities, load_yf_commodities
 from aisp.db.engine import get_engine, get_session_factory
 from aisp.db.models import AssetType, GlobalDaily
 
 logger = logging.getLogger(__name__)
 
-# International commodities via yfinance
-YF_COMMODITIES: dict[str, tuple[str, AssetType]] = {
-    "GC=F": ("Gold Futures", AssetType.COMMODITY),
-    "HG=F": ("Copper Futures", AssetType.COMMODITY),
-    "CL=F": ("Crude Oil WTI", AssetType.COMMODITY),
-    "SI=F": ("Silver Futures", AssetType.COMMODITY),
-}
-
-# Domestic commodities via AkShare (symbol → display name)
-AK_COMMODITIES: dict[str, str] = {
-    "碳酸锂": "碳酸锂",
-    "铁矿石": "铁矿石",
-}
+# Loaded from config/symbols.toml, can be overridden in tests via monkeypatch
+YF_COMMODITIES: dict[str, tuple[str, AssetType]] = load_yf_commodities()
+AK_COMMODITIES: dict[str, str] = load_ak_commodities()
 
 
 @with_retry(max_retries=3)
@@ -116,6 +107,11 @@ async def fetch_commodities(trade_date: date | None = None) -> int:
                             else 0.0
                         )
 
+                        import pandas as pd
+
+                        vol = row.get("Volume")
+                        volume = float(vol) if vol is not None and pd.notna(vol) else None
+
                         records.append(
                             {
                                 "trade_date": row_date,
@@ -127,11 +123,7 @@ async def fetch_commodities(trade_date: date | None = None) -> int:
                                 "low": float(row["Low"]),
                                 "close": close_val,
                                 "change_pct": round(change_pct, 4),
-                                "volume": (
-                                    float(row["Volume"])
-                                    if row.get("Volume")
-                                    else None
-                                ),
+                                "volume": volume,
                             }
                         )
                 except Exception:

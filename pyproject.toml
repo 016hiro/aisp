@@ -16,12 +16,14 @@ dependencies = [
     "httpx>=0.28",
     "pydantic-settings>=2.0",
     "pydantic>=2.0",
+    "playwright>=1.58.0",
 ]
 
 [project.optional-dependencies]
 data = [
     "yfinance>=0.2",
     "akshare>=1.10",
+    "baostock>=0.8.9",
 ]
 dev = [
     "pytest>=8.0",
@@ -43,3 +45,7 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aisp"]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

@@ -1,0 +1,27 @@
+# A-ISP 定时任务配置
+# 安装: crontab config/crontab.txt
+# 查看: crontab -l
+# 卸载: crontab -r
+#
+# ┌───── 分钟 (0-59)
+# │ ┌───── 小时 (0-23)
+# │ │ ┌───── 日 (1-31)
+# │ │ │ ┌───── 月 (1-12)
+# │ │ │ │ ┌───── 星期 (0=周日, 1-5=周一至周五)
+# │ │ │ │ │
+
+# === 早盘管道 ===
+# 每天 08:00 执行 (美股收盘后、A股开盘前)
+# fetch-us → fetch-commodities → screen → analyze → briefing
+0 8 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh morning
+
+# === 收盘管道 ===
+# 每个工作日 15:30 执行 (A股收盘后)
+# fetch-cn → update pools → track performance
+30 15 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh close
+
+# === 独立数据采集 (可选，已包含在上述管道中) ===
+# 如需单独运行，取消下面的注释
+# 0 7 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh fetch-us
+# 5 7 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh fetch-commodities
+# 0 15 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh fetch-cn

@@ -9,26 +9,14 @@ from datetime import date, timedelta
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from aisp.data import with_retry
+from aisp.data.symbols import load_us_symbols
 from aisp.db.engine import get_engine, get_session_factory
 from aisp.db.models import AssetType, GlobalDaily
 
 logger = logging.getLogger(__name__)
 
-# Symbols to fetch with their display names and types
-US_SYMBOLS: dict[str, tuple[str, AssetType]] = {
-    # Major indices
-    "^GSPC": ("S&P 500", AssetType.INDEX),
-    "^IXIC": ("Nasdaq Composite", AssetType.INDEX),
-    "^DJI": ("Dow Jones", AssetType.INDEX),
-    # China-related ETF
-    "KWEB": ("KraneShares CSI China Internet ETF", AssetType.STOCK),
-    # Key tech stocks
-    "AAPL": ("Apple", AssetType.STOCK),
-    "NVDA": ("NVIDIA", AssetType.STOCK),
-    "MSFT": ("Microsoft", AssetType.STOCK),
-    "TSLA": ("Tesla", AssetType.STOCK),
-    "AMD": ("AMD", AssetType.STOCK),
-}
+# Loaded from config/symbols.toml, can be overridden in tests via monkeypatch
+US_SYMBOLS: dict[str, tuple[str, AssetType]] = load_us_symbols()
 
 
 @with_retry(max_retries=3)
@@ -104,6 +92,11 @@ async def fetch_us_market(trade_date: date | None = None) -> int:
                     ((close_val - prev_close) / prev_close * 100) if prev_close else 0.0
                 )
 
+                import pandas as pd
+
+                vol = row.get("Volume")
+                volume = float(vol) if vol is not None and pd.notna(vol) else None
+
                 records.append(
                     {
                         "trade_date": row_date,
@@ -115,7 +108,7 @@ async def fetch_us_market(trade_date: date | None = None) -> int:
                         "low": float(row["Low"]),
                         "close": close_val,
                         "change_pct": round(change_pct, 4),
-                        "volume": float(row["Volume"]) if row.get("Volume") else None,
+                        "volume": volume,
                     }
                 )
         except Exception:

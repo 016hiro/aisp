@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 
-async def generate_briefing(trade_date: date) -> Path:
+async def generate_briefing(trade_date: date, *, btc_metrics=None) -> Path:
     """Generate daily briefing report with 5 sections.
 
     1. Global sentiment
@@ -88,7 +88,17 @@ async def generate_briefing(trade_date: date) -> Path:
                 else:
                     mood = "弱势看空"
                 sections.append(f"**全球情绪评分:** {mood} (主要指数均值: {avg_change:+.2f}%)\n")
-        else:
+
+        if btc_metrics is not None:
+            sections.append(
+                f"**BTC 风险偏好:** {btc_metrics.sentiment_label} ({btc_metrics.risk_score:.2f})"
+                f" | ${btc_metrics.price:,.0f}"
+                f" | 24h {btc_metrics.change_24h:+.1f}%"
+                f" | 7d {btc_metrics.change_7d:+.1f}%"
+                f" | 30d {btc_metrics.change_30d:+.1f}%\n"
+            )
+
+        if not globals_:
             sections.append("*暂无全球市场数据*\n")
 
         # ── Section 2: Sector Highlights ──
