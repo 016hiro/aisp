@@ -1,4 +1,9 @@
-# A-ISP 定时任务配置
+# A-ISP 定时任务配置 (已弃用，改用 launchd)
+#
+# ⚠️ macOS cron 在机器休眠时不会执行，醒来后也不会补跑。
+# 请使用 launchd 替代: config/launchd/install.sh install
+#
+# 以下保留仅供 Linux/非 macOS 环境参考。
 # 安装: crontab config/crontab.txt
 # 查看: crontab -l
 # 卸载: crontab -r
@@ -16,9 +21,9 @@
 0 8 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh morning
 
 # === 收盘管道 ===
-# 每个工作日 15:30 执行 (A股收盘后)
+# 每个工作日 18:00 执行 (BaoStock 17:30 完成日K线入库后)
 # fetch-cn → update pools → track performance
-30 15 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh close
+0 18 * * 1-5 /Users/lijunjie/github/aisp/config/cron.sh close
 
 # === 独立数据采集 (可选，已包含在上述管道中) ===
 # 如需单独运行，取消下面的注释

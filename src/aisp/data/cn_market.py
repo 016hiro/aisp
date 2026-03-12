@@ -138,12 +138,12 @@ def _fetch_all_codes_sync() -> list[str]:
 def _fetch_stock_daily_sync(
     codes: list[str],
     trade_date: date,
-    lookback_days: int = 10,
+    lookback_days: int = 50,
 ) -> list[dict]:
     """Fetch daily K-line data for given codes.
 
-    Queries trade_date minus lookback_days for volume_ratio computation.
-    Returns only records matching trade_date.
+    Returns records for ALL dates in the lookback range (for historical indicator
+    computation). volume_ratio is only computed for the target_date row.
     """
     import baostock as bs
 
@@ -179,50 +179,54 @@ def _fetch_stock_daily_sync(
             if not rows:
                 continue
 
-            # Separate today vs previous days for volume_ratio
-            today_row = None
-            prev_volumes: list[float] = []
+            # Collect all volumes for volume_ratio computation on target date
+            all_volumes: list[tuple[str, float]] = []
             for row in rows:
-                if row[0] == target_str:
-                    today_row = row
-                else:
-                    vol = _safe_float(row[7])
-                    if vol is not None and vol > 0:
-                        prev_volumes.append(vol)
+                vol = _safe_float(row[7])
+                if vol is not None and vol > 0:
+                    all_volumes.append((row[0], vol))
 
-            if today_row is None:
-                continue
+            # Return ALL rows so historical closes are stored in DB
+            for row in rows:
+                close = _safe_float(row[5]) or 0.0
+                if not close or close <= 0:
+                    continue
 
-            today_vol = _safe_float(today_row[7])
-            volume_ratio = None
-            if today_vol and prev_volumes:
-                recent = prev_volumes[-5:]
-                avg_vol = sum(recent) / len(recent)
-                if avg_vol > 0:
-                    volume_ratio = today_vol / avg_vol
+                row_date_str = row[0]
+                change_pct = _safe_float(row[9]) or 0.0
+                is_st_flag = row[11] == "1" if len(row) > 11 else False
+                st_name = "ST" if is_st_flag else ""
 
-            change_pct = _safe_float(today_row[9]) or 0.0
-            is_st_flag = today_row[11] == "1" if len(today_row) > 11 else False
-            st_name = "ST" if is_st_flag else ""
+                # volume_ratio only for target date
+                volume_ratio = None
+                if row_date_str == target_str:
+                    today_vol = _safe_float(row[7])
+                    prev_vols = [v for d, v in all_volumes if d < target_str]
+                    if today_vol and prev_vols:
+                        recent = prev_vols[-5:]
+                        avg_vol = sum(recent) / len(recent)
+                        if avg_vol > 0:
+                            volume_ratio = today_vol / avg_vol
 
-            results.append({
-                "code": _from_bs_code(today_row[1]),
-                "name": "",  # filled later from industry_map
-                "open": _safe_float(today_row[2]) or 0.0,
-                "high": _safe_float(today_row[3]) or 0.0,
-                "low": _safe_float(today_row[4]) or 0.0,
-                "close": _safe_float(today_row[5]) or 0.0,
-                "volume": _safe_float(today_row[7]) or 0.0,
-                "amount": _safe_float(today_row[8]) or 0.0,
-                "change_pct": change_pct,
-                "turnover_rate": _safe_float(today_row[10]),
-                "volume_ratio": volume_ratio,
-                "net_inflow": None,  # BaoStock 不提供资金流数据
-                "market_cap": None,  # 日线不含市值
-                "is_st": is_st_flag,
-                "is_limit_up": _is_limit_up(change_pct, st_name),
-                "is_limit_down": _is_limit_down(change_pct, st_name),
-            })
+                results.append({
+                    "code": _from_bs_code(row[1]),
+                    "name": "",
+                    "trade_date": date.fromisoformat(row_date_str),
+                    "open": _safe_float(row[2]) or 0.0,
+                    "high": _safe_float(row[3]) or 0.0,
+                    "low": _safe_float(row[4]) or 0.0,
+                    "close": close,
+                    "volume": _safe_float(row[7]) or 0.0,
+                    "amount": _safe_float(row[8]) or 0.0,
+                    "change_pct": change_pct,
+                    "turnover_rate": _safe_float(row[10]),
+                    "volume_ratio": volume_ratio,
+                    "net_inflow": None,
+                    "market_cap": None,
+                    "is_st": is_st_flag,
+                    "is_limit_up": _is_limit_up(change_pct, st_name),
+                    "is_limit_down": _is_limit_down(change_pct, st_name),
+                })
         except Exception:
             logger.debug("Failed to fetch data for %s", code)
 
@@ -456,7 +460,7 @@ async def fetch_cn_market(
             rec["is_st"] = _is_st(name)
         rec["is_limit_up"] = _is_limit_up(rec["change_pct"], name)
         rec["is_limit_down"] = _is_limit_down(rec["change_pct"], name)
-        rec["trade_date"] = target_date
+        # trade_date already set per-row by _fetch_stock_daily_sync
         stock_records.append(rec)
 
     result["stocks"] = await _upsert_stocks(stock_records, target_date)

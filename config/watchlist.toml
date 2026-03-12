@@ -1,0 +1,21 @@
+# A 股自选股
+#
+# fetch-cn --mode watchlist 时仅拉取此列表中的股票
+# 板块映射仍从 BaoStock 行业分类获取
+# 修改后无需重启，下次执行命令时自动生效。
+
+[[cn_watchlist]]
+code = "002709"
+name = "天赐材料"
+
+[[cn_watchlist]]
+code = "000807"
+name = "云铝股份"
+
+[[cn_watchlist]]
+code = "002463"
+name = "沪电股份"
+
+[[cn_watchlist]]
+code = "002837"
+name = "英维克"

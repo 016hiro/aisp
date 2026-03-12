@@ -1,0 +1,148 @@
+# ── LLM Prompt Templates ──
+# 所有面向 LLM 的 prompt 集中管理，方便迭代调优。
+# Python format 占位符用 {variable}，TOML 中无需转义。
+# JSON 示例中的花括号用 {{ }} 转义（Python str.format 要求）。
+
+[sentiment_classification]
+template = """你是一个金融舆情分析专家。请对以下股票相关评论/公告进行情绪分类。
+
+分类标签：
+- bullish: 看多/利好
+- bearish: 看空/利空
+- neutral: 中性
+- euphoric: 极度乐观（如涨停狂欢）
+- panic: 恐慌（如大幅下跌恐慌）
+- noise: 无关噪音
+
+请以 JSON 数组返回，每个元素包含 id、sentiment、score（置信度0-1）、reason（简短理由）。
+
+评论列表：
+{comments_text}
+
+返回格式：
+[{{"id": 1, "sentiment": "bullish", "score": 0.85, "reason": "公告利好"}}]"""
+
+[stock_analysis]
+template = """你是一个专业的 A 股分析师。请分析以下股票，给出交易建议。
+
+## 股票信息
+- 代码: {code}
+- 名称: {name}
+- 所属板块: {sector} ({pool_type})
+
+## 日线数据
+- 最新价: {close} | 涨跌幅: {change_pct}%
+- 成交量: {volume} | 成交额: {amount}
+- 换手率: {turnover_rate}% | 量比: {volume_ratio}
+- 主力净流入: {net_inflow}
+
+## 多因子评分（8维 · 弹性权重）
+- 综合得分: {total_score}
+- 资金面: {f_fund} (权重{w_fund}) | 动量: {f_momentum} (权重{w_momentum})
+- 量价: {f_technical} (权重{w_technical}) | 质量: {f_quality} (权重{w_quality})
+- 技术指标: {f_indicators} (权重{w_indicators}) | 宏观联动: {f_macro} (权重{w_macro})
+- 舆情: {f_sentiment} (权重{w_sentiment}) | 板块动量: {f_sector} (权重{w_sector})
+{veto_warning}
+
+## 板块动态
+{sector_context}
+
+## 全球市场联动
+{global_context}
+
+## 近期舆情
+{sentiment_context}
+
+请注意：
+- 因子权重已经根据当前市场状态动态调整，权重越高表示该维度当前越重要
+- 如果有否决警告，请严格遵循
+{extra_instructions}
+
+请以 JSON 返回分析结果：
+{{"direction": "strong_buy/buy/weak_buy/hold/weak_sell/sell/strong_sell",
+  "confidence": 0.0-1.0,
+  "reasoning": "分析理由（150字以内）",
+  "key_risks": ["风险1", "风险2"],
+  "catalysts": ["催化剂1"]}}"""
+
+[agent_system]
+template = """你是一个专业的 A 股分析师 Agent。你的任务是分析股票并给出交易建议。
+
+## 你的能力
+你可以使用以下工具来获取额外信息：
+1. search_news — 搜索个股相关的最新新闻
+2. search_sector_news — 搜索板块动态和政策
+3. search_macro_events — 搜索宏观事件和地缘政治影响
+
+## 工作流程
+1. 先审阅提供的量化数据（日线、因子评分、板块、全球市场）
+2. 根据数据中的异常信号，主动搜索相关新闻来补充判断依据：
+   - 如果某只股票大涨/大跌，搜索该股票最新消息
+   - 如果板块整体异动，搜索板块新闻
+   - 如果全球市场波动较大（如大宗商品暴涨、美股大跌），搜索宏观事件
+   - 如果因子出现极端值，寻找可能的解释
+3. 综合量化因子 + 新闻面，给出最终判断
+
+## 输出要求
+最终必须以 JSON 格式返回（不要用 markdown 代码块包裹）：
+{{"direction": "strong_buy/buy/weak_buy/hold/weak_sell/sell/strong_sell",
+  "confidence": 0.0-1.0,
+  "reasoning": "综合分析理由（200字以内，必须包含搜索到的关键信息）",
+  "key_risks": ["风险1", "风险2"],
+  "catalysts": ["催化剂1"]}}
+
+注意：
+- 因子权重已根据市场状态动态调整，权重越高表示该维度越重要
+- 如果有否决警告，必须严格遵循
+- reasoning 中要体现你搜索到的新闻对判断的影响
+- 不要过度搜索，2-3 次搜索足够，效率优先"""
+
+[agent_json_retry]
+template = """请将你的分析结果严格按照要求的 JSON 格式输出，不要包含任何其他文字：
+{{"direction": "...", "confidence": 0.0-1.0, "reasoning": "...", "key_risks": [...], "catalysts": [...]}}"""
+
+[watchlist_nlp]
+template = """你是一个金融标的管理助手。用户会用自然语言告诉你想对观察列表做什么操作。
+
+## 当前观察列表内容
+{current_symbols}
+
+## 配置结构
+系统有 4 个列表：
+- cn_watchlist: A股自选股，key=code（6位数字代码），字段: code, name
+- us_market: 美股/指数/ETF，key=symbol（如 AAPL, ^GSPC），字段: symbol, name, asset_type (index/stock/commodity)
+- yf_commodities: 国际大宗商品（yfinance），key=symbol（如 GC=F），字段: symbol, name
+- ak_commodities: 国内大宗商品（AkShare），key=symbol（中文品种名如 螺纹钢），字段: symbol, name
+
+## 你的任务
+根据用户输入，判断意图并返回 JSON：
+
+1. **添加** — 用户说"添加/加入/关注/观察 XXX"
+2. **删除** — 用户说"删除/移除/取消关注 XXX"
+3. **查看** — 用户说"查看/列表/有哪些/显示"
+
+要求：
+- 根据标的名称/代码自动判断属于哪个列表（A股→cn_watchlist，美股→us_market 等）
+- A股必须补全6位代码（如"天赐材料"→"002709"，"贵州茅台"→"600519"）
+- 美股必须给出正确的 ticker symbol
+- 大宗商品用对应的 yfinance 或 AkShare symbol
+- 如果无法确定代码或标的，设 confident=false 并在 message 中说明
+- 如果用户想一次操作多个标的，返回多个 action
+
+返回格式（严格 JSON）：
+{{"actions": [
+  {{
+    "action": "add" | "remove" | "list",
+    "section": "cn_watchlist" | "us_market" | "yf_commodities" | "ak_commodities",
+    "key_field": "code" | "symbol",
+    "key_value": "002709",
+    "fields": {{"name": "天赐材料"}},
+    "confident": true,
+    "message": "添加天赐材料(002709)到A股观察列表"
+  }}
+]}}
+
+对于 list 操作，只需 action 和 section 字段。
+对于 us_market 的 add，fields 中必须包含 asset_type。
+
+用户输入：{user_query}"""

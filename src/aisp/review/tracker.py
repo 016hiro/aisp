@@ -12,8 +12,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from aisp.data.calendar import get_next_trading_date
 from aisp.db.engine import get_engine, get_session_factory
 from aisp.db.models import (
+    BULLISH_DIRECTIONS,
     DailySignals,
-    Direction,
     Evaluation,
     SignalPerformance,
     StkDaily,
@@ -54,10 +54,12 @@ class PerformanceTracker:
         evaluated_count = 0
 
         async with session_factory() as session:
-            # Find BUY signals that haven't been evaluated yet
+            # Find bullish signals that haven't been evaluated yet
             result = await session.execute(
                 select(DailySignals).where(
-                    DailySignals.direction == Direction.BUY,
+                    DailySignals.direction.in_(
+                        [d.value for d in BULLISH_DIRECTIONS]
+                    ),
                     DailySignals.trade_date < trade_date,
                     ~DailySignals.id.in_(
                         select(SignalPerformance.signal_id).where(
@@ -151,10 +153,12 @@ class PerformanceTracker:
         stats = PerformanceStats()
 
         async with session_factory() as session:
-            # Total signals
+            # Total signals (bullish directions)
             total_result = await session.execute(
                 select(func.count()).select_from(DailySignals).where(
-                    DailySignals.direction == Direction.BUY
+                    DailySignals.direction.in_(
+                        [d.value for d in BULLISH_DIRECTIONS]
+                    )
                 )
             )
             stats.total_signals = total_result.scalar() or 0

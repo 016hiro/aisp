@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aisp.morning</string>
+
+    <key>Comment</key>
+    <string>A-ISP morning pipeline: fetch-us/commodities/btc → screen → analyze → briefing</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lijunjie/github/aisp/config/cron.sh</string>
+        <string>morning</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lijunjie/github/aisp</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lijunjie/github/aisp/logs/launchd_morning.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lijunjie/github/aisp/logs/launchd_morning.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/lijunjie</string>
+        <key>PATH</key>
+        <string>/Users/lijunjie/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

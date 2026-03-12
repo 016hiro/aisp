@@ -15,7 +15,7 @@ from aisp.db.models import AssetType, GlobalDaily
 
 logger = logging.getLogger(__name__)
 
-# Loaded from config/symbols.toml, can be overridden in tests via monkeypatch
+# Loaded from config/markets.toml, can be overridden in tests via monkeypatch
 YF_COMMODITIES: dict[str, tuple[str, AssetType]] = load_yf_commodities()
 AK_COMMODITIES: dict[str, str] = load_ak_commodities()
 

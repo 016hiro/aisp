@@ -12,6 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from aisp.db.engine import get_engine, get_session_factory
 from aisp.db.models import (
+    BULLISH_DIRECTIONS,
     DailySignals,
     Direction,
     PoolType,
@@ -116,10 +117,12 @@ async def check_exit_signals(trade_date: date) -> list[dict]:
     exits = []
 
     async with session_factory() as session:
-        # Get active BUY signals
+        # Get active bullish signals
         result = await session.execute(
             select(DailySignals).where(
-                DailySignals.direction == Direction.BUY,
+                DailySignals.direction.in_(
+                    [d.value for d in BULLISH_DIRECTIONS]
+                ),
                 DailySignals.trade_date <= trade_date,
             )
         )
@@ -211,10 +214,14 @@ async def show_status() -> None:
 
         for s in signals:
             dir_style = {
+                Direction.STRONG_BUY: "bold green",
                 Direction.BUY: "bold green",
-                Direction.SELL: "bold red",
+                Direction.WEAK_BUY: "green",
                 Direction.HOLD: "yellow",
                 Direction.WATCH: "dim",
+                Direction.WEAK_SELL: "red",
+                Direction.SELL: "bold red",
+                Direction.STRONG_SELL: "bold red",
             }.get(s.direction, "")
 
             signal_table.add_row(

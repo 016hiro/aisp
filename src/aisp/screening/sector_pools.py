@@ -38,6 +38,11 @@ class SectorPoolManager:
     def __init__(self):
         self.settings = get_settings()
         self.pool_config = self.settings.pool
+        # Load core sectors from config/sectors.toml if not set via env
+        if not self.pool_config.core_sectors:
+            from aisp.data.symbols import load_core_sectors
+
+            self.pool_config.core_sectors = load_core_sectors()
 
     async def update_pools(self, trade_date: date) -> list[PoolResult]:
         """Update all three pools for the given trade date.

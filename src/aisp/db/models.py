@@ -46,10 +46,18 @@ class Sentiment(enum.StrEnum):
 
 
 class Direction(enum.StrEnum):
+    STRONG_BUY = "strong_buy"
     BUY = "buy"
-    SELL = "sell"
+    WEAK_BUY = "weak_buy"
     HOLD = "hold"
     WATCH = "watch"
+    WEAK_SELL = "weak_sell"
+    SELL = "sell"
+    STRONG_SELL = "strong_sell"
+
+
+BULLISH_DIRECTIONS = {Direction.STRONG_BUY, Direction.BUY, Direction.WEAK_BUY}
+BEARISH_DIRECTIONS = {Direction.STRONG_SELL, Direction.SELL, Direction.WEAK_SELL}
 
 
 class PoolType(enum.StrEnum):

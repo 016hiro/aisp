@@ -131,16 +131,20 @@ async def populated_db(db_session):
 def test_config_loads():
     """Test that configuration loads with defaults."""
     settings = get_settings()
-    assert settings.scoring.weight_fund == 0.4
-    assert settings.scoring.weight_momentum == 0.3
-    assert settings.scoring.weight_technical == 0.2
-    assert settings.scoring.weight_quality == 0.1
-    # Weights should sum to 1.0
+    assert settings.scoring.weight_fund == 0.20
+    assert settings.scoring.weight_indicators == 0.20
+    assert settings.scoring.elasticity == 2.0
+    assert settings.veto.macro_floor == 0.15
+    # 8-factor weights should sum to 1.0
     total = (
         settings.scoring.weight_fund
         + settings.scoring.weight_momentum
         + settings.scoring.weight_technical
         + settings.scoring.weight_quality
+        + settings.scoring.weight_indicators
+        + settings.scoring.weight_macro
+        + settings.scoring.weight_sentiment
+        + settings.scoring.weight_sector
     )
     assert abs(total - 1.0) < 0.001
 
