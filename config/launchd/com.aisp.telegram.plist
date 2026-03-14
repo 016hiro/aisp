@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aisp.telegram</string>
+
+    <key>Comment</key>
+    <string>A-ISP Telegram bot — screenshot OCR import daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lijunjie/github/aisp/config/cron.sh</string>
+        <string>telegram</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lijunjie/github/aisp</string>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lijunjie/github/aisp/logs/launchd_telegram.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lijunjie/github/aisp/logs/launchd_telegram.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/lijunjie</string>
+        <key>PATH</key>
+        <string>/Users/lijunjie/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

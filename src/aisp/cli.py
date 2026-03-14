@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -45,6 +47,102 @@ async def _latest_cn_trade_date() -> date | None:
     return result
 
 
+async def _ensure_cn_data(dt: date, code_list: list[str] | None = None) -> None:
+    """Auto-fetch CN stock + sector data if missing for the target date.
+
+    Checks stk_daily count for target codes; if zero, fetches watchlist
+    stocks and sector daily data from BaoStock/AkShare.
+    """
+    from sqlalchemy import func, select
+
+    from aisp.db.engine import get_engine, get_session_factory
+    from aisp.db.models import StkDaily
+
+    engine = get_engine()
+    sf = get_session_factory(engine)
+
+    # Check if we have any stock data for target date
+    check_codes = code_list
+    if not check_codes:
+        from aisp.data.symbols import load_cn_watchlist
+
+        wl = load_cn_watchlist()
+        check_codes = [item["code"] for item in wl] if wl else None
+
+    async with sf() as session:
+        q = select(func.count(StkDaily.code)).where(StkDaily.trade_date == dt)
+        if check_codes:
+            q = q.where(StkDaily.code.in_(check_codes))
+        count = await session.scalar(q)
+
+    await engine.dispose()
+
+    if count and count > 0:
+        return  # data exists
+
+    console.print(f"[yellow]No CN data for {dt}, auto-fetching...[/yellow]")
+
+    from aisp.data.cn_market import fetch_cn_market
+
+    # Determine fetch codes: use code_list if given, else watchlist
+    fetch_codes = code_list
+    if not fetch_codes:
+        from aisp.data.symbols import load_cn_watchlist
+
+        wl = load_cn_watchlist()
+        fetch_codes = [item["code"] for item in wl] if wl else None
+
+    try:
+        result = await fetch_cn_market(dt, codes=fetch_codes)
+        mode_label = f"watchlist ({len(fetch_codes)} stocks)" if fetch_codes else "full"
+        console.print(f"[green]  Auto-fetched CN data ({mode_label}): {result}[/green]")
+    except Exception as e:
+        console.print(f"[red]  Auto-fetch failed: {e}[/red]")
+        console.print("[yellow]  Continuing with available data...[/yellow]")
+
+
+async def _ensure_global_data(dt: date) -> None:
+    """Auto-fetch US market + commodity data if missing for the target date.
+
+    Checks global_daily count for the date; if zero or very few records,
+    fetches US market and commodity data before proceeding.
+    """
+    from sqlalchemy import func, select
+
+    from aisp.db.engine import get_engine, get_session_factory
+    from aisp.db.models import GlobalDaily
+
+    engine = get_engine()
+    sf = get_session_factory(engine)
+
+    async with sf() as session:
+        count = await session.scalar(
+            select(func.count(GlobalDaily.symbol)).where(GlobalDaily.trade_date == dt)
+        )
+
+    await engine.dispose()
+
+    if count and count >= 3:
+        return  # enough data exists
+
+    console.print(f"[yellow]Insufficient global data for {dt} ({count or 0} records), auto-fetching...[/yellow]")
+
+    from aisp.data.commodities import fetch_commodities as _fetch_commodities
+    from aisp.data.us_market import fetch_us_market
+
+    try:
+        us_count = await fetch_us_market(dt)
+        console.print(f"[green]  Auto-fetched US market: {us_count} records[/green]")
+    except Exception as e:
+        console.print(f"[yellow]  US market fetch failed: {e}[/yellow]")
+
+    try:
+        cm_count = await _fetch_commodities(dt)
+        console.print(f"[green]  Auto-fetched commodities: {cm_count} records[/green]")
+    except Exception as e:
+        console.print(f"[yellow]  Commodity fetch failed: {e}[/yellow]")
+
+
 @app.command()
 def init_db():
     """Initialize the database (create all tables)."""
@@ -79,14 +177,14 @@ def fetch_commodities(
 @app.command()
 def fetch_cn(
     trade_date: str | None = typer.Option(None, help="Date YYYY-MM-DD, default today"),
-    mode: str = typer.Option("full", help="Fetch mode: full | watchlist | codes"),
+    mode: str = typer.Option("watchlist", help="Fetch mode: watchlist | full | codes"),
     codes: str | None = typer.Option(None, help="Comma-separated stock codes (for mode=codes)"),
 ):
     """Fetch A-share market data (stocks, sectors, fund flow).
 
     Modes:
+      watchlist - Only fetch stocks defined in config/symbols.toml [[cn_watchlist]] (default)
       full      - Fetch all stocks from BaoStock industry classification (slow, ~5000 stocks)
-      watchlist - Only fetch stocks defined in config/watchlist.toml [[cn_watchlist]]
       codes     - Only fetch specified codes, e.g. --codes 600519,000858,601398
     """
     from aisp.data.cn_market import fetch_cn_market
@@ -196,8 +294,11 @@ def run_analysis_pipeline(
 ):
     """screen → analyze → briefing (3-in-1 pipeline).
 
-    Without --codes, automatically loads watchlist from config/watchlist.toml
+    Without --codes, automatically loads watchlist from config/symbols.toml
     to ensure all watchlist stocks are analyzed (not just pool top-N).
+
+    If CN stock data is missing for the target date, auto-fetches watchlist
+    stocks before proceeding.
     """
     from aisp.data.symbols import load_cn_watchlist
     from aisp.engine.analyzer import run_analysis
@@ -215,6 +316,10 @@ def run_analysis_pipeline(
             console.print(f"[dim]Watchlist: {len(code_list)} stocks[/dim]")
 
     async def _pipeline():
+        # Auto-fetch missing data before analysis
+        await _ensure_cn_data(dt, code_list)
+        await _ensure_global_data(dt)
+
         console.print("[bold]Step 1/3: Running sector screening...[/bold]")
         pool_mgr = SectorPoolManager()
         pools = await pool_mgr.update_pools(dt)
@@ -225,7 +330,14 @@ def run_analysis_pipeline(
         count = await run_analysis(dt, codes=code_list)
         console.print(f"[dim]  Generated {count} signals[/dim]")
 
-        console.print("[bold]Step 3/3: Generating briefing...[/bold]")
+        console.print("[bold]Step 3/4: Evaluating signal performance...[/bold]")
+        from aisp.review.tracker import PerformanceTracker
+
+        tracker = PerformanceTracker()
+        eval_count = await tracker.evaluate_signals(dt)
+        console.print(f"[dim]  Evaluated {eval_count} signals[/dim]")
+
+        console.print("[bold]Step 4/4: Generating briefing...[/bold]")
         path = await generate_briefing(dt)
         return path
 
@@ -335,7 +447,304 @@ def status():
     _run(show_status())
 
 
+# ── Portfolio: import & view ──────────────────────────────
+
+
+@app.command()
+def import_positions(
+    screenshots: Annotated[list[Path], typer.Argument(help="One or more screenshot files (png/jpg/webp)")],
+    trade_date: str | None = typer.Option(None, "--date", "-d", help="Snapshot date YYYY-MM-DD (override OCR)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """Import positions from broker app screenshots via LLM OCR."""
+    from rich.table import Table
+
+    from aisp.portfolio.ocr import extract_positions as _extract
+
+    async def _do():
+        data = await _extract(screenshots)
+        return data
+
+    data = _run(_do())
+    # Override snapshot_date if user specified --date
+    if trade_date:
+        data["snapshot_date"] = trade_date
+    positions = data.get("positions") or []
+    if not positions:
+        console.print("[yellow]No positions extracted from screenshots.[/yellow]")
+        return
+
+    # Display confidence & warnings
+    confidence = data.get("confidence", 0)
+    console.print(f"\n[bold]Extracted {len(positions)} positions[/bold]  "
+                  f"(date: {data['snapshot_date']}, confidence: {confidence:.0%})")
+    for w in data.get("warnings") or []:
+        console.print(f"  [yellow]⚠ {w}[/yellow]")
+
+    # Rich table preview
+    table = Table(title="Positions Preview")
+    table.add_column("Code", style="cyan")
+    table.add_column("Name")
+    table.add_column("Qty", justify="right")
+    table.add_column("Avail", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Price", justify="right")
+    table.add_column("P/L", justify="right")
+    table.add_column("P/L%", justify="right")
+
+    for p in positions:
+        pl = p.get("profit_loss")
+        pl_pct = p.get("profit_loss_pct")
+        pl_style = "red" if (pl and pl > 0) else "green" if (pl and pl < 0) else ""
+        table.add_row(
+            p.get("code", ""),
+            p.get("name", ""),
+            str(p.get("quantity", "")),
+            str(p.get("available_quantity", "")),
+            f"{p['avg_cost']:.2f}" if p.get("avg_cost") else "",
+            f"{p['current_price']:.2f}" if p.get("current_price") else "",
+            f"[{pl_style}]{pl:+.2f}[/{pl_style}]" if pl is not None else "",
+            f"[{pl_style}]{pl_pct:+.2f}%[/{pl_style}]" if pl_pct is not None else "",
+        )
+    console.print(table)
+
+    if not yes:
+        typer.confirm("Write to database?", abort=True)
+
+    from aisp.portfolio.importer import import_positions as _import
+
+    count = _run(_import(data))
+    console.print(f"[green]Imported {count} position snapshots.[/green]")
+
+
+@app.command()
+def import_trades(
+    screenshots: Annotated[list[Path], typer.Argument(help="One or more screenshot files (png/jpg/webp)")],
+    trade_date: str | None = typer.Option(None, "--date", "-d", help="Trade date YYYY-MM-DD (override OCR)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """Import trade records from broker app screenshots via LLM OCR."""
+    from rich.table import Table
+
+    from aisp.portfolio.ocr import extract_trades as _extract
+
+    async def _do():
+        data = await _extract(screenshots)
+        return data
+
+    data = _run(_do())
+    # Override trade_date for all trades if user specified --date
+    if trade_date:
+        for t in data.get("trades") or []:
+            t["trade_date"] = trade_date
+    trades = data.get("trades") or []
+    if not trades:
+        console.print("[yellow]No trades extracted from screenshots.[/yellow]")
+        return
+
+    confidence = data.get("confidence", 0)
+    console.print(f"\n[bold]Extracted {len(trades)} trades[/bold]  "
+                  f"(confidence: {confidence:.0%})")
+    for w in data.get("warnings") or []:
+        console.print(f"  [yellow]⚠ {w}[/yellow]")
+
+    table = Table(title="Trades Preview")
+    table.add_column("Date", style="dim")
+    table.add_column("Code", style="cyan")
+    table.add_column("Name")
+    table.add_column("Dir")
+    table.add_column("Price", justify="right")
+    table.add_column("Qty", justify="right")
+    table.add_column("Amount", justify="right")
+    table.add_column("Fees", justify="right")
+
+    for t in trades:
+        direction = t.get("trade_direction", "")
+        dir_style = "red" if direction == "buy" else "green"
+        dir_label = "买入" if direction == "buy" else "卖出"
+        total_cost = t.get("total_cost")
+        table.add_row(
+            t.get("trade_date", ""),
+            t.get("code", ""),
+            t.get("name", ""),
+            f"[{dir_style}]{dir_label}[/{dir_style}]",
+            f"{t['price']:.2f}" if t.get("price") else "",
+            str(t.get("quantity", "")),
+            f"{t['amount']:,.2f}" if t.get("amount") else "",
+            f"{total_cost:.2f}" if total_cost is not None else "",
+        )
+    console.print(table)
+
+    if not yes:
+        typer.confirm("Write to database?", abort=True)
+
+    from aisp.portfolio.importer import import_trades as _import
+
+    count = _run(_import(data))
+    console.print(f"[green]Imported {count} trade records.[/green]")
+
+
+@app.command()
+def positions(
+    trade_date: str | None = typer.Option(None, "--date", "-d", help="Date YYYY-MM-DD, default latest"),
+):
+    """View position snapshots."""
+    from sqlalchemy import func, select
+
+    from aisp.db.engine import get_engine, get_session_factory
+    from aisp.db.models import PositionSnapshot
+
+    async def _query():
+        engine = get_engine()
+        sf = get_session_factory(engine)
+        async with sf() as session:
+            if trade_date:
+                dt = date.fromisoformat(trade_date)
+            else:
+                dt = await session.scalar(
+                    select(func.max(PositionSnapshot.snapshot_date))
+                )
+            if not dt:
+                return None, []
+            result = await session.execute(
+                select(PositionSnapshot)
+                .where(PositionSnapshot.snapshot_date == dt)
+                .order_by(PositionSnapshot.code)
+            )
+            rows = result.scalars().all()
+        await engine.dispose()
+        return dt, rows
+
+    dt, rows = _run(_query())
+    if not rows:
+        console.print("[dim]No position snapshots found.[/dim]")
+        return
+
+    from rich.table import Table
+
+    table = Table(title=f"Positions — {dt}")
+    table.add_column("Code", style="cyan")
+    table.add_column("Name")
+    table.add_column("Qty", justify="right")
+    table.add_column("Avail", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Price", justify="right")
+    table.add_column("Mkt Value", justify="right")
+    table.add_column("P/L", justify="right")
+    table.add_column("P/L%", justify="right")
+    table.add_column("Today P/L", justify="right")
+
+    total_mv = 0.0
+    total_pl = 0.0
+    for r in rows:
+        pl_style = "red" if (r.profit_loss and r.profit_loss > 0) else (
+            "green" if (r.profit_loss and r.profit_loss < 0) else ""
+        )
+        today_style = "red" if (r.today_profit_loss and r.today_profit_loss > 0) else (
+            "green" if (r.today_profit_loss and r.today_profit_loss < 0) else ""
+        )
+        if r.market_value:
+            total_mv += r.market_value
+        if r.profit_loss:
+            total_pl += r.profit_loss
+        table.add_row(
+            r.code,
+            r.name,
+            str(r.quantity),
+            str(r.available_quantity) if r.available_quantity is not None else "",
+            f"{r.avg_cost:.2f}",
+            f"{r.current_price:.2f}" if r.current_price else "",
+            f"{r.market_value:,.2f}" if r.market_value else "",
+            f"[{pl_style}]{r.profit_loss:+,.2f}[/{pl_style}]" if r.profit_loss is not None else "",
+            f"[{pl_style}]{r.profit_loss_pct:+.2f}%[/{pl_style}]" if r.profit_loss_pct is not None else "",
+            f"[{today_style}]{r.today_profit_loss:+,.2f}[/{today_style}]" if r.today_profit_loss is not None else "",
+        )
+
+    console.print(table)
+    pl_total_style = "red" if total_pl > 0 else "green" if total_pl < 0 else ""
+    console.print(
+        f"  Total market value: {total_mv:,.2f}  |  "
+        f"Total P/L: [{pl_total_style}]{total_pl:+,.2f}[/{pl_total_style}]"
+    )
+
+
+@app.command()
+def trades(
+    trade_date: str | None = typer.Option(None, "--date", "-d", help="Date YYYY-MM-DD"),
+    days: int = typer.Option(7, "--days", "-n", help="Show trades from last N days"),
+):
+    """View trade records."""
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from aisp.db.engine import get_engine, get_session_factory
+    from aisp.db.models import TradeRecord
+
+    async def _query():
+        engine = get_engine()
+        sf = get_session_factory(engine)
+        async with sf() as session:
+            q = select(TradeRecord)
+            if trade_date:
+                dt = date.fromisoformat(trade_date)
+                q = q.where(TradeRecord.trade_date == dt)
+            else:
+                cutoff = date.today() - timedelta(days=days)
+                q = q.where(TradeRecord.trade_date >= cutoff)
+            q = q.order_by(TradeRecord.trade_date.desc(), TradeRecord.code)
+            result = await session.execute(q)
+            rows = result.scalars().all()
+        await engine.dispose()
+        return rows
+
+    rows = _run(_query())
+    if not rows:
+        console.print("[dim]No trade records found.[/dim]")
+        return
+
+    from rich.table import Table
+
+    title = f"Trades — {trade_date}" if trade_date else f"Trades — last {days} days"
+    table = Table(title=title)
+    table.add_column("Date", style="dim")
+    table.add_column("Code", style="cyan")
+    table.add_column("Name")
+    table.add_column("Dir")
+    table.add_column("Price", justify="right")
+    table.add_column("Qty", justify="right")
+    table.add_column("Amount", justify="right")
+    table.add_column("Fees", justify="right")
+    table.add_column("Net", justify="right")
+
+    for r in rows:
+        dir_style = "red" if r.trade_direction.value == "buy" else "green"
+        dir_label = "买入" if r.trade_direction.value == "buy" else "卖出"
+        table.add_row(
+            r.trade_date.isoformat(),
+            r.code,
+            r.name,
+            f"[{dir_style}]{dir_label}[/{dir_style}]",
+            f"{r.price:.2f}",
+            str(r.quantity),
+            f"{r.amount:,.2f}",
+            f"{r.total_cost:.2f}" if r.total_cost is not None else "",
+            f"{r.net_amount:,.2f}" if r.net_amount is not None else "",
+        )
+
+    console.print(table)
+    console.print(f"  {len(rows)} records total")
+
+
 # ── Natural language watchlist ─────────────────────────────
+
+
+@app.command()
+def telegram():
+    """Start Telegram bot (long polling)."""
+    from aisp.telegram.bot import run_bot
+
+    run_bot()
 
 
 @app.command()

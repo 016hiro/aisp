@@ -22,6 +22,7 @@ dependencies = [
     "deepagents>=0.4",
     "ddgs>=7.0",
     "textual>=0.50",
+    "python-telegram-bot>=21.0",
 ]
 
 [project.optional-dependencies]

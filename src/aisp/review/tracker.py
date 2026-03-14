@@ -147,28 +147,35 @@ class PerformanceTracker:
         return evaluated_count
 
     async def get_stats(self, lookback_days: int = 30) -> PerformanceStats:
-        """Get rolling performance statistics."""
+        """Get rolling performance statistics within lookback window."""
+        from datetime import timedelta
+
         engine = get_engine()
         session_factory = get_session_factory(engine)
         stats = PerformanceStats()
+        cutoff = date.today() - timedelta(days=lookback_days)
 
         async with session_factory() as session:
-            # Total signals (bullish directions)
+            # Total bullish signals in window
             total_result = await session.execute(
                 select(func.count()).select_from(DailySignals).where(
                     DailySignals.direction.in_(
                         [d.value for d in BULLISH_DIRECTIONS]
-                    )
+                    ),
+                    DailySignals.trade_date >= cutoff,
                 )
             )
             stats.total_signals = total_result.scalar() or 0
 
-            # Evaluation counts
-            for eval_type in [Evaluation.CORRECT, Evaluation.WRONG, Evaluation.NEUTRAL, Evaluation.PENDING]:
+            # Evaluation counts in window
+            for eval_type in [Evaluation.CORRECT, Evaluation.WRONG, Evaluation.NEUTRAL]:
                 count_result = await session.execute(
                     select(func.count())
                     .select_from(SignalPerformance)
-                    .where(SignalPerformance.evaluation == eval_type)
+                    .where(
+                        SignalPerformance.evaluation == eval_type,
+                        SignalPerformance.signal_date >= cutoff,
+                    )
                 )
                 count = count_result.scalar() or 0
 
@@ -178,17 +185,33 @@ class PerformanceTracker:
                     stats.wrong = count
                 elif eval_type == Evaluation.NEUTRAL:
                     stats.neutral = count
-                elif eval_type == Evaluation.PENDING:
-                    stats.pending = count
 
             stats.evaluated = stats.correct + stats.wrong + stats.neutral
+
+            # Pending = bullish signals without non-pending evaluation in window
+            pending_result = await session.execute(
+                select(func.count()).select_from(DailySignals).where(
+                    DailySignals.direction.in_(
+                        [d.value for d in BULLISH_DIRECTIONS]
+                    ),
+                    DailySignals.trade_date >= cutoff,
+                    ~DailySignals.id.in_(
+                        select(SignalPerformance.signal_id).where(
+                            SignalPerformance.evaluation != Evaluation.PENDING
+                        )
+                    ),
+                )
+            )
+            stats.pending = pending_result.scalar() or 0
+
             if stats.evaluated > 0:
                 stats.accuracy = stats.correct / stats.evaluated
 
-            # Average return
+            # Average return in window
             avg_result = await session.execute(
                 select(func.avg(SignalPerformance.next_change_pct)).where(
-                    SignalPerformance.evaluation != Evaluation.PENDING
+                    SignalPerformance.evaluation != Evaluation.PENDING,
+                    SignalPerformance.signal_date >= cutoff,
                 )
             )
             stats.avg_return = avg_result.scalar() or 0.0

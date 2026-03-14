@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A-ISP 定时任务执行脚本
-# 用法: cron.sh <morning|close|fetch-us|fetch-commodities|fetch-cn>
+# 用法: cron.sh <morning|close|fetch-us|fetch-commodities|fetch-cn|telegram>
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 COMMAND="${1:-}"
 
 if [[ -z "$COMMAND" ]]; then
-    echo "Usage: $0 <morning|close|fetch-us|fetch-commodities|fetch-cn>"
+    echo "Usage: $0 <morning|close|fetch-us|fetch-commodities|fetch-cn|telegram>"
     exit 1
 fi
 
@@ -40,9 +40,12 @@ case "$COMMAND" in
     fetch-cn)
         ${UV} run aisp --log-file "${LOG_FILE}" fetch-cn 2>&1 | tee -a "${LOG_FILE}"
         ;;
+    telegram)
+        ${UV} run aisp --log-file "${LOG_FILE}" telegram 2>&1 | tee -a "${LOG_FILE}"
+        ;;
     *)
         echo "Unknown command: ${COMMAND}" | tee -a "${LOG_FILE}"
-        echo "Usage: $0 <morning|close|fetch-us|fetch-commodities|fetch-cn>" | tee -a "${LOG_FILE}"
+        echo "Usage: $0 <morning|close|fetch-us|fetch-commodities|fetch-cn|telegram>" | tee -a "${LOG_FILE}"
         exit 1
         ;;
 esac

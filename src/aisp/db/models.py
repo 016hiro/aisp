@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.0 async models — 10 tables for A-ISP."""
+"""SQLAlchemy 2.0 async models — 13 tables for A-ISP."""
 
 from __future__ import annotations
 
@@ -71,6 +71,17 @@ class Evaluation(enum.StrEnum):
     WRONG = "wrong"
     NEUTRAL = "neutral"
     PENDING = "pending"
+
+
+class TradeDirection(enum.StrEnum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class ImportSource(enum.StrEnum):
+    OCR = "ocr"
+    MANUAL = "manual"
+    TELEGRAM = "telegram"
 
 
 # ── 1. stk_daily ───────────────────────────────────────
@@ -320,3 +331,80 @@ class TradingCalendar(Base):
     is_trading_day: Mapped[bool] = mapped_column(Boolean, nullable=False)
     prev_trading_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     next_trading_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+# ── 11. position_snapshot ────────────────────────────────
+
+
+class PositionSnapshot(Base):
+    __tablename__ = "position_snapshot"
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "code", name="uq_position_snapshot_date_code"),
+        Index("ix_position_snapshot_date", "snapshot_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    name: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    available_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_cost: Mapped[float] = mapped_column(Float, nullable=False)
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_loss_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    today_profit_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    import_source: Mapped[ImportSource] = mapped_column(Enum(ImportSource), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# ── 12. trade_record ─────────────────────────────────────
+
+
+class TradeRecord(Base):
+    __tablename__ = "trade_record"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date", "code", "trade_direction", "price", "quantity",
+            name="uq_trade_record_natural_key",
+        ),
+        Index("ix_trade_record_date", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    name: Mapped[str] = mapped_column(String(50), nullable=False)
+    trade_direction: Mapped[TradeDirection] = mapped_column(Enum(TradeDirection), nullable=False)
+
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+
+    commission: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stamp_tax: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transfer_fee: Mapped[float | None] = mapped_column(Float, nullable=True)
+    other_fees: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    settlement_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    import_source: Mapped[ImportSource] = mapped_column(Enum(ImportSource), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# ── 13. image_hash ──────────────────────────────────────
+
+
+class ImageHash(Base):
+    __tablename__ = "image_hash"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

@@ -163,6 +163,90 @@ async def _get_sentiment_context(session, code: str, trade_date: date) -> str:
     return "\n".join(lines)
 
 
+def _merge_trading_plans(quant: dict | None, llm: dict | None) -> dict | None:
+    """Merge quantitative and LLM trading plans.
+
+    LLM adjustments (entry_zone, stop_loss, targets, guidance) take priority;
+    quant provides price_limits, position_hint, t1_note as base.
+    """
+    if not quant and not llm:
+        return None
+    if not quant:
+        return llm
+    if not llm:
+        return quant
+
+    merged = dict(quant)
+    # LLM overrides for price levels
+    if llm.get("entry_zone"):
+        merged["entry_zone"] = llm["entry_zone"]
+    if llm.get("stop_loss") is not None:
+        merged["stop_loss"] = llm["stop_loss"]
+    if llm.get("targets"):
+        merged["targets"] = llm["targets"]
+    if llm.get("guidance"):
+        merged["guidance"] = llm["guidance"]
+
+    # Recalculate risk/reward if we have the needed values
+    entry = merged.get("entry_zone")
+    sl = merged.get("stop_loss")
+    targets = merged.get("targets")
+    if entry and sl and targets and len(entry) == 2:
+        entry_mid = (entry[0] + entry[1]) / 2
+        risk = entry_mid - sl
+        reward = targets[0] - entry_mid
+        merged["risk_reward"] = round(reward / risk, 1) if risk > 0 else 0.0
+
+    return merged
+
+
+_BULLISH_DOWNGRADE = {
+    Direction.STRONG_BUY: Direction.BUY,
+    Direction.BUY: Direction.WEAK_BUY,
+    Direction.WEAK_BUY: Direction.HOLD,
+}
+
+
+def _apply_direction_guardrails(
+    direction: Direction,
+    trading_plan: dict | None,
+    trend: dict | None,
+) -> Direction:
+    """Override direction when R:R or trend data contradicts.
+
+    1. R:R consistency: bullish signal + R:R < 1.0 → downgrade one level
+    2. Trend filter: 3+ consecutive down days with > -5% decline → block buy
+    """
+    is_bullish = direction in (Direction.STRONG_BUY, Direction.BUY, Direction.WEAK_BUY)
+    if not is_bullish:
+        return direction
+
+    # Rule 1: R:R < 1.0 → downgrade
+    if trading_plan and trading_plan.get("entry_zone"):
+        rr = trading_plan.get("risk_reward", 0)
+        if rr < 1.0:
+            direction = _BULLISH_DOWNGRADE.get(direction, direction)
+            logger.info(
+                "Direction downgraded due to poor R:R (%.1f): %s",
+                rr, direction.value,
+            )
+
+    # Rule 2: Persistent downtrend → block buy
+    if trend:
+        consec = trend.get("consecutive_down", 0)
+        cum_pct = trend.get("cumulative_pct", 0)
+        ma5_below = trend.get("ma5_below_ma20", False)
+        # 3+ consecutive down days AND cumulative decline > 5% AND MA5 < MA20
+        if consec >= 3 and cum_pct <= -5.0 and ma5_below:
+            direction = Direction.HOLD
+            logger.info(
+                "Direction blocked to HOLD: %d consecutive down days (%.1f%%), MA5<MA20",
+                consec, cum_pct,
+            )
+
+    return direction
+
+
 async def run_analysis(
     trade_date: date, *, btc_metrics=None, codes: list[str] | None = None
 ) -> int:
@@ -275,6 +359,24 @@ async def run_analysis(
                         + "\n- 请重点关注上述突破信号对短期走势的影响"
                     )
 
+                trading_plan = stock.raw_data.get("_trading_plan")
+                if trading_plan and trading_plan.get("entry_zone"):
+                    ez = trading_plan["entry_zone"]
+                    extra_instructions += (
+                        "\n## 量化交易计划（请验证并调整）\n"
+                        f"- 入场区间: {ez[0]:.2f} - {ez[1]:.2f}\n"
+                        f"- 止损位: {trading_plan['stop_loss']:.2f}\n"
+                        f"- 目标位: {', '.join(f'{t:.2f}' for t in trading_plan['targets'])}\n"
+                        f"- 风险收益比: {trading_plan['risk_reward']:.1f}\n"
+                        f"- 涨停/跌停: {trading_plan['price_limits']['down']:.2f}"
+                        f" ~ {trading_plan['price_limits']['up']:.2f}\n"
+                        f"- {trading_plan['t1_note']}\n"
+                    )
+                elif trading_plan:
+                    extra_instructions += (
+                        f"\n## 交易提示\n- {trading_plan.get('rationale', '')}\n"
+                    )
+
                 prompt = format_stock_analysis(
                     code=stock.code,
                     name=stock.name,
@@ -319,6 +421,16 @@ async def run_analysis(
                     except ValueError:
                         direction = Direction.HOLD
 
+                    # Merge trading plans: LLM adjustments over quant base
+                    quant_plan = stock.raw_data.get("_trading_plan")
+                    llm_plan = result.trading_plan
+                    final_plan = _merge_trading_plans(quant_plan, llm_plan)
+
+                    # ── Direction guardrails ──
+                    direction = _apply_direction_guardrails(
+                        direction, final_plan, stock.raw_data.get("_trend"),
+                    )
+
                     return {
                         "trade_date": trade_date,
                         "code": stock.code,
@@ -334,6 +446,7 @@ async def run_analysis(
                             "_key_risks": result.key_risks,
                             "_catalysts": result.catalysts,
                             "_breakout": stock.raw_data.get("_breakout"),
+                            "_trading_plan": final_plan,
                         },
                         "confidence": result.confidence,
                         "reasoning": result.reasoning,

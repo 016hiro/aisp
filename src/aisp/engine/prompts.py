@@ -60,3 +60,13 @@ def format_sentiment_classification(**kwargs) -> str:
 def format_watchlist_nlp(**kwargs) -> str:
     """Format watchlist NLP prompt."""
     return get_template("watchlist_nlp").format(**kwargs)
+
+
+def format_ocr_positions(today: str) -> str:
+    """Format OCR positions extraction prompt."""
+    return get_template("ocr_positions").format(today=today)
+
+
+def format_ocr_trades() -> str:
+    """Format OCR trades extraction prompt."""
+    return get_template("ocr_trades")

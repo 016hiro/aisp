@@ -10,12 +10,12 @@
 
 - **全球数据整合**：自动采集美股指数/个股（yfinance）、大宗商品、BTC 风险偏好指标、A 股个股行情（BaoStock TCP）、行业板块涨跌（AkShare THS 源）
 - **三池板块管理**：核心池（长期关注）、冲锋池（短期热点）、机会池（超跌反弹）动态轮转
-- **8因子弹性权重选股 + 威科夫校准 + 突破检测**：资金面 + 动量 + 量价 + 质量 + 技术指标(RSI/MACD/均线) + 宏观联动 + 舆情 + 板块动量，弹性权重自动提权极端因子 + 硬规则否决兜底 + 威科夫吸筹/派发阶段后置校准乘数 + 突破信号检测（盘整/均线/新高低三类，强信号注入 LLM prompt）
+- **8因子弹性权重选股 + 威科夫校准 + 突破检测 + 精细化交易计划**：资金面 + 动量 + 量价 + 质量 + 技术指标(RSI/MACD/均线) + 宏观联动 + 舆情 + 板块动量，弹性权重自动提权极端因子 + 硬规则否决兜底 + 威科夫吸筹/派发阶段后置校准乘数 + 突破信号检测（盘整/均线/新高低三类，强信号注入 LLM prompt）+ 量化交易计划（入场区间/止损/目标价/风险收益比，LLM 验证调整）+ 方向护栏（R:R<1.0 自动降级 + 连跌趋势过滤）
 - **BTC 风险偏好**：5 维度复合评分（短/中/长期动量 + 波动率状态 + 回撤位置），注入 LLM prompt 和 Briefing
 - **Deep Agent 分析**：个股深度分析采用 LangChain Deep Agents 框架，内置任务规划和上下文管理，可主动搜索新闻和宏观事件（DuckDuckGo），结合量化因子 + 实时资讯给出判断
 - **双模型 LLM 策略**：快速模型做舆情分类和自然语言解析，强模型驱动 Agent 做个股深度分析，通过 OpenRouter 灵活切换
-- **信号绩效追踪**：T+1 自动评估信号准确率，含硬止损和追踪止盈退出规则
-- **每日简报**：5 节 Markdown 日报——全球情绪（含 BTC）、板块异动、信号总览、个股详细分析卡（日线数据 + RSI(3/6/9)/MACD(6,13,5) 技术面 + 8 因子评分表 + 板块概况 + LLM 分析/风险/催化剂）、绩效回顾
+- **信号绩效追踪**：T+1 自动评估信号准确率（滚动30日窗口），pipeline 内自动评估历史信号并更新统计数据
+- **每日简报**：5 节 Markdown 日报——全球情绪（含 BTC）、板块异动、信号总览、个股详细分析卡（日线数据 + RSI(3/6/9)/MACD(6,13,5) 技术面 + 8 因子评分表 + 板块概况 + 交易计划表 + LLM 分析/风险/催化剂）、绩效回顾
 - **自然语言观察列表**：`aisp watch "添加天赐材料"` 由 LLM 解析意图并自动补全代码/symbol，支持 A 股/美股/大宗四类标的
 
 ## 快速开始
@@ -76,6 +76,11 @@ AISP_BREAKOUT__ENABLED=true            # 是否启用突破检测
 AISP_BREAKOUT__STRONG_THRESHOLD=0.60   # 强信号阈值（注入LLM prompt）
 AISP_BREAKOUT__WEAK_THRESHOLD=0.35     # 弱信号阈值（仅调乘数）
 AISP_BREAKOUT__VOL_CONFIRM_RATIO=1.5   # 放量确认基准
+
+# 交易计划生成层（可选）
+AISP_TRADING_PLAN__ENABLED=true       # 是否启用交易计划
+AISP_TRADING_PLAN__ATR_PERIOD=20      # ATR 计算周期
+AISP_TRADING_PLAN__STOP_BUFFER_PCT=0.01  # 止损缓冲比例
 ```
 
 所有配置项均支持环境变量覆盖，前缀 `AISP_`，嵌套用 `__` 分隔。
@@ -112,7 +117,7 @@ config/launchd/install.sh uninstall
 ```bash
 uv run aisp fetch-us             # 采集美股数据
 uv run aisp fetch-commodities    # 采集大宗商品
-uv run aisp fetch-cn             # 采集 A 股行情（默认全量，--mode watchlist 仅自选）
+uv run aisp fetch-cn             # 采集 A 股行情（默认自选股，--mode full 全量）
 uv run aisp screen               # 板块过滤 + 个股评分
 uv run aisp analyze              # LLM 分析 + 信号生成
 uv run aisp briefing             # 生成每日简报
@@ -122,6 +127,61 @@ uv run aisp status               # 查看当前池状态和活跃信号
 ```
 
 所有命令支持 `--trade-date YYYY-MM-DD` 指定交易日，默认为当天。
+
+### 持仓/交割单管理
+
+通过券商 APP 截图导入持仓和交割记录，使用多模态 LLM OCR 提取数据：
+
+```bash
+# 导入持仓截图（支持多张截图合并去重）
+uv run aisp import-positions screenshot1.png screenshot2.png
+uv run aisp import-positions screenshot.jpg --yes    # 跳过确认直接入库
+
+# 导入交割单截图
+uv run aisp import-trades trade1.png trade2.png
+uv run aisp import-trades trade.jpg --yes
+
+# 查看持仓快照（默认最新日期）
+uv run aisp positions
+uv run aisp positions --date 2024-03-13
+
+# 查看交割记录（默认最近7天）
+uv run aisp trades
+uv run aisp trades --date 2024-03-13
+uv run aisp trades --days 30
+```
+
+OCR 流程：校验截图 → LLM 多模态提取 → Rich 表格预览 + 置信度 → 用户确认 → 写入 DB。支持 PNG/JPG/JPEG/WEBP 格式。
+
+默认 OCR 模型 `google/gemini-3.1-flash-lite-preview`（通过 OpenRouter），可通过 `AISP_OCR__MODEL` 覆盖。
+
+### Telegram Bot 截图导入
+
+通过 Telegram Bot 直接发送截图完成持仓/交割单导入，替代手动传图+跑命令：
+
+```bash
+# 启动 Bot（前台长轮询）
+uv run aisp telegram
+
+# 或使用 launchd 守护进程（崩溃自动重启）
+config/launchd/install.sh install
+```
+
+**配置**（`.env`）：
+```bash
+AISP_TELEGRAM__BOT_TOKEN=123456:ABC-DEF...      # BotFather 获取
+AISP_TELEGRAM__ALLOWED_USER_IDS=[123456789]      # 限制授权用户（空=不限制）
+```
+
+**交互流程**：
+```
+/positions → 发截图 → /done → OCR → [Confirm] [Cancel] [Change Date] → 入库
+/trades    → 发截图 → /done → OCR → [Confirm] [Cancel] [Change Date] → 入库
+```
+
+- 图片 SHA256 去重，重复图片自动跳过
+- OCR 使用 `analysis_model`（默认 Claude Sonnet）保证识别质量
+- 支持压缩图片和原图文件（PNG/JPG/WEBP）
 
 ### 观察列表管理
 
@@ -158,11 +218,13 @@ uv run aisp watch-ls --type us                         # 列出美股列表
 
 | 模式 | 说明 | 用法 |
 |------|------|------|
-| `full`（默认） | 拉取 BaoStock 全市场股票（~5000 只） | `uv run aisp fetch-cn` |
-| `watchlist` | 仅拉取 `config/symbols.toml` 中 `[[cn_watchlist]]` 定义的自选股 | `uv run aisp fetch-cn --mode watchlist` |
+| `watchlist`（默认） | 仅拉取 `config/symbols.toml` 中 `[[cn_watchlist]]` 定义的自选股 | `uv run aisp fetch-cn` |
+| `full` | 拉取 BaoStock 全市场股票（~5000 只） | `uv run aisp fetch-cn --mode full` |
 | `codes` | 仅拉取命令行指定的股票代码 | `uv run aisp fetch-cn --mode codes --codes 600519,000858` |
 
-三种模式下，个股日线数据均通过 BaoStock（TCP 协议，不受 HTTP 代理影响）获取；板块涨跌数据独立通过 AkShare THS 源获取（`stock_board_industry_summary_ths`，90 个同花顺行业板块）。`watchlist` 和 `codes` 模式适合日常快速更新，`full` 模式适合初始化或全量刷新。
+三种模式下，个股日线数据均通过 BaoStock（TCP 协议，不受 HTTP 代理影响）获取；板块涨跌数据独立通过 AkShare THS 源获取（`stock_board_industry_summary_ths`，90 个同花顺行业板块）。`watchlist`（默认）和 `codes` 模式适合日常快速更新，`full` 模式适合初始化或全量刷新。
+
+`run-analysis-pipeline` 会自动检测目标日期是否有 CN 数据，如缺失则自动拉取观察列表股票数据后再继续。
 
 ### 全局选项
 
@@ -272,6 +334,48 @@ uv run aisp --log-file app.log   # 同时写入日志文件
 
 所有参数可通过 `AISP_BREAKOUT__*` 环境变量覆盖。`AISP_BREAKOUT__ENABLED=false` 可完全关闭。
 
+### 精细化交易计划
+
+在威科夫校准和突破检测之后，系统自动生成结构化交易计划，将已有的支撑/阻力、均线、ATR 等数据合成为具体操作价位：
+
+| 项目 | 计算方式 | 说明 |
+|------|----------|------|
+| **入场区间** | 当前价下方最近支撑 ~ 当前价 | 区间宽度 ≤ 1.5×ATR(20)，涨停/跌停时为空 |
+| **止损位** | max(支撑-1%缓冲, 入场低-1×ATR) | 下限为跌停价，ST 用 0.5×ATR |
+| **目标价** | 入场上方前两个阻力位 | 无阻力时用 1.5/2.5×ATR，上限为涨停价 |
+| **风险收益比** | (目标1-入场中点)/(入场中点-止损) | ≥3→积极, ≥1.5→正常, <1.5→保守 |
+| **涨跌停** | 普通±10%, 创业板/科创板±20%, ST±5% | 自动识别板块类型 |
+
+**两层结合**：量化模块先生成初始计划（纯函数，无 LLM 调用），注入 Agent prompt 后由 LLM 验证/调整，补充集合竞价策略和盘中操作建议。最终合并结果展示在信号详情卡片中。
+
+**A 股特殊规则**：
+- 集合竞价（9:15-9:25）策略建议
+- T+1 规则提醒（当日买入次日才能卖出）
+- 涨停/跌停封板时不生成入场区间，仅输出风险提示
+
+**R:R 保护机制**：
+- 止损距入场中点不低于 1.5%（防止极端 R:R 值）
+- R:R 结果 clamp 至 [0, 10.0] 区间
+
+所有参数可通过 `AISP_TRADING_PLAN__*` 环境变量覆盖。`AISP_TRADING_PLAN__ENABLED=false` 可完全关闭。
+
+### 方向护栏（Direction Guardrails）
+
+LLM 返回信号方向后，系统自动执行两层护栏检查，防止方向与量化数据矛盾：
+
+| 规则 | 触发条件 | 动作 |
+|------|----------|------|
+| **R:R 一致性** | 看多信号(BUY/WEAK_BUY) + R:R < 1.0 | 自动降级一档（BUY→WEAK_BUY→HOLD） |
+| **下跌趋势过滤** | 连续3+天下跌 + 累计跌幅>5% + MA5<MA20 | 强制 HOLD，阻止买入信号 |
+
+趋势数据（`_trend`）在评分阶段计算并存入 `raw_data`，包含连跌天数、累计跌幅和 MA 交叉状态。
+
+### 数据自动补全
+
+`run-analysis-pipeline` 执行前自动检查并补全缺失数据：
+- **CN 数据**：检测 `stk_daily` 中目标日期是否有数据，缺失则自动拉取 watchlist 股票
+- **全球数据**：检测 `global_daily` 中目标日期记录数，不足 3 条则自动拉取 US 市场 + 大宗商品
+
 ### BTC 风险偏好指标
 
 BTC 作为全球风险偏好的代理指标，通过 yfinance 获取 45 天历史数据，计算 5 个维度的复合评分（不入库，按需计算）：
@@ -342,7 +446,7 @@ src/aisp/
 ├── config.py              # Pydantic Settings 配置
 ├── logging_config.py      # 日志配置（Rich + 文件）
 ├── db/
-│   ├── models.py          # 10 张 SQLAlchemy 表
+│   ├── models.py          # 12 张 SQLAlchemy 表
 │   └── engine.py          # 异步数据库引擎
 ├── watch_nlp.py           # 自然语言观察列表管理
 ├── data/
@@ -362,7 +466,15 @@ src/aisp/
 │   ├── indicators.py      # 技术指标纯函数(RSI/MACD/均线)
 │   ├── wyckoff.py         # 威科夫阶段检测纯函数(后置校准层)
 │   ├── breakout.py        # 突破信号检测纯函数(三类突破+强度评分)
+│   ├── trading_plan.py    # 精细化交易计划生成(入场/止损/目标/风险收益比)
 │   └── factor_engine.py   # 弹性权重引擎 + 否决规则
+├── portfolio/
+│   ├── ocr.py             # LLM 多模态 OCR (LangChain ChatOpenAI)
+│   └── importer.py        # 持仓/交割单 DB 写入 (upsert)
+├── telegram/
+│   ├── bot.py             # Telegram Bot 主逻辑 (ConversationHandler)
+│   ├── dedup.py           # 图片 SHA256 去重
+│   └── formatter.py       # Telegram 消息格式化 (HTML)
 ├── engine/
 │   ├── llm_client.py      # OpenRouter 客户端
 │   ├── analyzer.py        # LLM 分析编排
@@ -375,7 +487,7 @@ src/aisp/
     └── briefing.py        # Markdown 简报生成
 ```
 
-### 数据库表（10 张）
+### 数据库表（13 张）
 
 | 表名 | 用途 | 主键/唯一约束 |
 |------|------|---------------|
@@ -389,6 +501,9 @@ src/aisp/
 | `sector_pool_state` | 板块池当前状态 | `(sector_name, pool_type)` |
 | `sector_pool_history` | 板块池资格检查日志 | `(trade_date, sector_name, pool_type)` |
 | `trading_calendar` | A 股交易日历 | `cal_date` |
+| `position_snapshot` | 持仓快照（每日，OCR/手动导入） | `(snapshot_date, code)` |
+| `trade_record` | 交割单/成交记录（OCR/手动导入） | `(trade_date, code, direction, price, qty)` |
+| `image_hash` | 图片 SHA256 去重记录（Telegram Bot） | `hash` (unique) |
 
 所有写入使用 SQLite upsert (`on_conflict_do_update`) 保证幂等性，批量插入采用 500 行分块。
 

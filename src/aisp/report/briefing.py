@@ -7,7 +7,6 @@ from datetime import date, datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.markdown import Markdown
 from sqlalchemy import select
 
 from aisp.config import get_settings
@@ -152,6 +151,51 @@ def _build_signal_card(
             score = b.get("strength_score", 0)
             lines.append(f"- {desc}（强度: {score:.2f}）")
         lines.append("")
+
+    # ── 交易计划 ──
+    trading_plan = f.get("_trading_plan")
+    if trading_plan:
+        entry = trading_plan.get("entry_zone")
+        if entry:
+            lines.append("**交易计划**")
+            lines.append("| 项目 | 价位 |")
+            lines.append("|------|------|")
+            lines.append(f"| 入场区间 | {entry[0]:.2f} — {entry[1]:.2f} |")
+            sl = trading_plan.get("stop_loss")
+            if sl:
+                lines.append(f"| 止损 | {sl:.2f} |")
+            for i, t in enumerate(trading_plan.get("targets", []), 1):
+                lines.append(f"| 目标{i} | {t:.2f} |")
+            rr = trading_plan.get("risk_reward", 0)
+            lines.append(f"| 风险收益比 | {rr:.1f} |")
+            limits = trading_plan.get("price_limits", {})
+            if limits:
+                lines.append(
+                    f"| 涨停/跌停 | {limits.get('up', 0):.2f} / {limits.get('down', 0):.2f} |"
+                )
+            lines.append("")
+            guidance = trading_plan.get("guidance")
+            if guidance:
+                lines.append(f"> {guidance}")
+                lines.append("")
+            hint = trading_plan.get("position_hint")
+            t1 = trading_plan.get("t1_note")
+            if hint or t1:
+                parts = []
+                if hint:
+                    hint_cn = {
+                        "aggressive": "积极", "normal": "正常", "conservative": "保守",
+                    }.get(hint, hint)
+                    parts.append(f"仓位: {hint_cn}")
+                if t1:
+                    parts.append(t1)
+                lines.append(f"*{'  |  '.join(parts)}*")
+                lines.append("")
+        else:
+            rationale = trading_plan.get("rationale", "")
+            if rationale:
+                lines.append(f"> {rationale}")
+                lines.append("")
 
     # ── LLM 分析 ──
     lines.append("**LLM 分析**")
@@ -387,20 +431,26 @@ async def generate_briefing(trade_date: date, *, btc_metrics=None) -> Path:
         else:
             sections.append("*今日无信号*\n")
 
-        # ── Section 5: Yesterday's Performance ──
-        sections.append("## 5. 昨日绩效回顾\n")
+        # ── Section 5: Performance Review (rolling 30 days) ──
+        sections.append("## 5. 近30日绩效回顾\n")
 
         tracker = PerformanceTracker()
-        stats = await tracker.get_stats()
+        # Evaluate any pending signals before computing stats
+        await tracker.evaluate_signals(trade_date)
+        stats = await tracker.get_stats(lookback_days=30)
 
         if stats.evaluated > 0:
-            sections.append(f"- **总信号数:** {stats.total_signals}")
+            accuracy_pct = f"{stats.accuracy:.1%}"
+            sections.append(f"- **近30日看多信号数:** {stats.total_signals}")
             sections.append(f"- **已评估:** {stats.evaluated}")
-            sections.append(f"- **准确率:** {stats.accuracy:.1%} ({stats.correct}正确 / {stats.wrong}错误 / {stats.neutral}中性)")
-            sections.append(f"- **平均收益:** {stats.avg_return:+.2f}%")
+            sections.append(
+                f"- **准确率:** {accuracy_pct}"
+                f" ({stats.correct}正确 / {stats.wrong}错误 / {stats.neutral}中性)"
+            )
+            sections.append(f"- **平均T+1日内收益:** {stats.avg_return:+.2f}%")
             sections.append(f"- **待评估:** {stats.pending}")
         else:
-            sections.append("*暂无历史绩效数据*")
+            sections.append("*近30日暂无已评估信号*")
 
         sections.append("")
 
@@ -414,9 +464,6 @@ async def generate_briefing(trade_date: date, *, btc_metrics=None) -> Path:
     briefing_dir.mkdir(parents=True, exist_ok=True)
     filepath = briefing_dir / f"{trade_date}.md"
     filepath.write_text(content, encoding="utf-8")
-
-    # Display in terminal
-    console.print(Markdown(content))
 
     logger.info("Briefing saved to %s", filepath)
     return filepath

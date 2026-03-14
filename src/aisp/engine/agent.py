@@ -86,6 +86,7 @@ class AgentResult:
     key_risks: list[str]
     catalysts: list[str]
     raw: dict
+    trading_plan: dict | None = None
 
 
 # ── Agent creation ────────────────────────────────────────────────
@@ -172,6 +173,7 @@ async def analyze_stock(prompt: str) -> AgentResult | None:
         key_risks=parsed.get("key_risks", []),
         catalysts=parsed.get("catalysts", []),
         raw=parsed,
+        trading_plan=parsed.get("trading_plan"),
     )
 
 

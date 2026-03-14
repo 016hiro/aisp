@@ -88,6 +88,30 @@ class BreakoutConfig(BaseModel):
     w_gap: float = 0.15
 
 
+class TradingPlanConfig(BaseModel):
+    """Quantitative trading plan generation — runs after Wyckoff + breakout."""
+
+    enabled: bool = True
+    atr_period: int = 20
+    entry_zone_max_atr_width: float = 1.5
+    stop_buffer_pct: float = 0.01  # 止损位低于支撑的缓冲比例
+    st_atr_multiplier: float = 0.5  # ST 更紧止损
+    normal_atr_multiplier: float = 1.0
+
+
+class OcrConfig(BaseModel):
+    """OCR extraction via multimodal LLM."""
+
+    model: str = "google/gemini-3.1-flash-lite-preview"
+    confidence_threshold: float = 0.7
+    max_image_size_mb: int = 10
+
+
+class TelegramConfig(BaseModel):
+    bot_token: str = ""
+    allowed_user_ids: list[int] = Field(default_factory=list)
+
+
 class PoolConfig(BaseModel):
     core_sectors: list[str] = Field(default_factory=list)
     momentum_top_n: int = 5
@@ -126,6 +150,9 @@ class Settings(BaseSettings):
     veto: VetoConfig = Field(default_factory=VetoConfig)
     wyckoff: WyckoffConfig = Field(default_factory=WyckoffConfig)
     breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
+    trading_plan: TradingPlanConfig = Field(default_factory=TradingPlanConfig)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     pool: PoolConfig = Field(default_factory=PoolConfig)
     asset_linkage: AssetLinkageConfig = Field(default_factory=AssetLinkageConfig)
 

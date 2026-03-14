@@ -393,6 +393,37 @@ class StockScorer:
                     if s.strength == "strong"
                 ]
 
+            # ── Trading plan generation ──
+            from aisp.screening.trading_plan import (
+                compute_trading_plan,
+                trading_plan_to_dict,
+            )
+
+            trading_plan_dict = None
+            tp_config = self.settings.trading_plan
+            if tp_config.enabled:
+                prelim_dir = (
+                    "buy" if calibrated_score >= 0.6
+                    else ("sell" if calibrated_score <= 0.35 else "hold")
+                )
+                tp = compute_trading_plan(
+                    code=d["code"],
+                    closes=closes,
+                    bars=ohlcv_by_code.get(d["code"], []),
+                    wyckoff_data=_wyckoff_to_dict(wyckoff_result),
+                    breakout_data=breakout_strong or None,
+                    is_st=False,
+                    is_limit_up=False,
+                    is_limit_down=False,
+                    direction=prelim_dir,
+                    config=tp_config,
+                )
+                if tp:
+                    trading_plan_dict = trading_plan_to_dict(tp)
+
+            # ── Trend detection (for direction override) ──
+            trend_info = _compute_trend(closes)
+
             scored.append(ScoredStock(
                 code=d["code"],
                 name=d["name"],
@@ -406,6 +437,8 @@ class StockScorer:
                     **d,
                     "_wyckoff": _wyckoff_to_dict(wyckoff_result),
                     "_breakout": breakout_strong or None,
+                    "_trading_plan": trading_plan_dict,
+                    "_trend": trend_info,
                 },
                 wyckoff_phase=wyckoff_result.phase.value if wyckoff_result else None,
                 wyckoff_multiplier=wyckoff_result.multiplier if wyckoff_result else 1.0,
@@ -513,6 +546,46 @@ def _percentile_rank(values: list[float | None], default: float = 0.5) -> list[f
         result[orig_idx] = rank / max(valid_n - 1, 1)
 
     return result
+
+
+def _compute_trend(closes: list[float]) -> dict:
+    """Detect recent downtrend from closing prices.
+
+    Returns dict with:
+      consecutive_down: number of consecutive declining days (from most recent)
+      cumulative_pct: total decline over the consecutive period (negative = decline)
+      ma5_below_ma20: True if MA5 < MA20 (short-term bearish)
+    """
+    if len(closes) < 3:
+        return {"consecutive_down": 0, "cumulative_pct": 0.0, "ma5_below_ma20": False}
+
+    # Count consecutive declining closes from most recent
+    consecutive_down = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] < closes[i - 1]:
+            consecutive_down += 1
+        else:
+            break
+
+    # Cumulative decline over the consecutive period
+    cumulative_pct = 0.0
+    if consecutive_down > 0 and len(closes) > consecutive_down:
+        start_price = closes[-(consecutive_down + 1)]
+        end_price = closes[-1]
+        cumulative_pct = round((end_price - start_price) / start_price * 100, 2)
+
+    # MA5 vs MA20
+    ma5_below_ma20 = False
+    if len(closes) >= 20:
+        ma5 = sum(closes[-5:]) / 5
+        ma20 = sum(closes[-20:]) / 20
+        ma5_below_ma20 = ma5 < ma20
+
+    return {
+        "consecutive_down": consecutive_down,
+        "cumulative_pct": cumulative_pct,
+        "ma5_below_ma20": ma5_below_ma20,
+    }
 
 
 def _wyckoff_to_dict(result) -> dict | None:

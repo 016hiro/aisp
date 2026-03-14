@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-AGENTS=("com.aisp.morning" "com.aisp.close")
+AGENTS=("com.aisp.morning" "com.aisp.close" "com.aisp.telegram")
 
 _load() {
     local label="$1"
@@ -61,8 +61,9 @@ case "${1:-}" in
 
         echo ""
         echo "✅ Installed. Agents will run even after sleep/wake."
-        echo "   Morning: 08:00 daily"
-        echo "   Close:   18:00 daily"
+        echo "   Morning:  08:00 daily"
+        echo "   Close:    18:00 daily"
+        echo "   Telegram: always running (KeepAlive)"
         echo ""
         echo "Check status: $0 status"
         echo "View logs:    tail -f logs/launchd_morning.log"
