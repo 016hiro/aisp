@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from aisp.config import get_settings
+from aisp.engine.llm_client import local_breaker
 from aisp.engine.prompts import format_ocr_positions, format_ocr_trades
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,8 @@ _EXT_TO_MIME = {
 }
 
 
-def _create_ocr_llm(model_override: str | None = None) -> ChatOpenAI:
-    """Create LangChain ChatOpenAI for OCR (multimodal, low temperature)."""
+def _create_remote_ocr_llm(model_override: str | None = None) -> ChatOpenAI:
+    """Create LangChain ChatOpenAI for OCR via remote OpenRouter."""
     settings = get_settings()
     return ChatOpenAI(
         model=model_override or settings.ocr.model,
@@ -39,9 +40,35 @@ def _create_ocr_llm(model_override: str | None = None) -> ChatOpenAI:
     )
 
 
+def _create_local_ocr_llm() -> ChatOpenAI | None:
+    """Create local LLM for OCR, or None if unavailable."""
+    settings = get_settings()
+    local_cfg = settings.local_llm
+    if not (local_cfg.enabled and local_cfg.ocr_model) or local_breaker.is_open():
+        return None
+    return ChatOpenAI(
+        model=local_cfg.ocr_model,
+        openai_api_key=local_cfg.api_key,
+        openai_api_base=local_cfg.base_url,
+        temperature=0.1,
+        max_tokens=4000,
+        request_timeout=local_cfg.request_timeout,
+        max_retries=0,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+
+
+def _strip_thinking(text: str) -> str:
+    """Strip thinking blocks from reasoning-model output (e.g. Qwen3).
+
+    Handles both '<think>...</think>' and bare '...</think>' (no opening tag).
+    """
+    return re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 def _parse_json(text: str) -> dict | None:
     """Parse JSON with three-layer fallback (same as agent.py pattern)."""
-    text = text.strip()
+    text = _strip_thinking(text).strip()
 
     # Direct parse
     try:
@@ -102,12 +129,31 @@ async def _ocr_single_image(llm: ChatOpenAI, prompt: str, path: Path) -> dict | 
     return _parse_json(response.content)
 
 
+async def _ocr_image_with_fallback(
+    prompt: str, path: Path, model_override: str | None = None
+) -> dict | None:
+    """Try local LLM first for OCR, fall back to remote on failure."""
+    if not model_override:
+        local_llm = _create_local_ocr_llm()
+        if local_llm:
+            try:
+                result = await _ocr_single_image(local_llm, prompt, path)
+                local_breaker.record_success()
+                logger.info("OCR from local server: %s", path.name)
+                return result
+            except Exception as e:
+                local_breaker.record_failure()
+                logger.info("Local OCR failed for %s (%s), falling back to remote", path.name, e)
+
+    remote_llm = _create_remote_ocr_llm(model_override)
+    return await _ocr_single_image(remote_llm, prompt, path)
+
+
 async def extract_positions(image_paths: list[Path]) -> dict:
     """Extract positions from multiple screenshots, merge by code (last wins)."""
     from datetime import date
 
     settings = get_settings()
-    llm = _create_ocr_llm()
     prompt = format_ocr_positions(today=date.today().isoformat())
 
     merged: dict[str, dict] = {}
@@ -117,7 +163,7 @@ async def extract_positions(image_paths: list[Path]) -> dict:
 
     for path in image_paths:
         validate_image(path, max_mb=settings.ocr.max_image_size_mb)
-        result = await _ocr_single_image(llm, prompt, path)
+        result = await _ocr_image_with_fallback(prompt, path)
         if not result:
             all_warnings.append(f"Failed to parse OCR result from {path.name}")
             continue
@@ -144,7 +190,6 @@ async def extract_positions(image_paths: list[Path]) -> dict:
 async def extract_trades(image_paths: list[Path]) -> dict:
     """Extract trades from multiple screenshots, merge by natural key."""
     settings = get_settings()
-    llm = _create_ocr_llm()
     prompt = format_ocr_trades()
 
     seen: set[tuple] = set()
@@ -154,7 +199,7 @@ async def extract_trades(image_paths: list[Path]) -> dict:
 
     for path in image_paths:
         validate_image(path, max_mb=settings.ocr.max_image_size_mb)
-        result = await _ocr_single_image(llm, prompt, path)
+        result = await _ocr_image_with_fallback(prompt, path)
         if not result:
             all_warnings.append(f"Failed to parse OCR result from {path.name}")
             continue
@@ -200,6 +245,26 @@ async def _ocr_single_bytes(
     return _parse_json(response.content)
 
 
+async def _ocr_bytes_with_fallback(
+    prompt: str, image_bytes: bytes, mime_type: str, model_override: str | None = None
+) -> dict | None:
+    """Try local LLM first for OCR bytes, fall back to remote on failure."""
+    if not model_override:
+        local_llm = _create_local_ocr_llm()
+        if local_llm:
+            try:
+                result = await _ocr_single_bytes(local_llm, prompt, image_bytes, mime_type)
+                local_breaker.record_success()
+                logger.info("OCR from local server (bytes)")
+                return result
+            except Exception as e:
+                local_breaker.record_failure()
+                logger.info("Local OCR failed (bytes) (%s), falling back to remote", e)
+
+    remote_llm = _create_remote_ocr_llm(model_override)
+    return await _ocr_single_bytes(remote_llm, prompt, image_bytes, mime_type)
+
+
 async def extract_positions_from_bytes(
     images: list[tuple[bytes, str]],
     snapshot_date: str | None = None,
@@ -208,7 +273,6 @@ async def extract_positions_from_bytes(
     """Extract positions from in-memory images (bytes, mime_type), merge by code."""
     from datetime import date as date_cls
 
-    llm = _create_ocr_llm(model_override)
     today = snapshot_date or date_cls.today().isoformat()
     prompt = format_ocr_positions(today=today)
 
@@ -218,7 +282,7 @@ async def extract_positions_from_bytes(
     min_confidence = 1.0
 
     for image_bytes, mime_type in images:
-        result = await _ocr_single_bytes(llm, prompt, image_bytes, mime_type)
+        result = await _ocr_bytes_with_fallback(prompt, image_bytes, mime_type, model_override)
         if not result:
             all_warnings.append("Failed to parse OCR result from image")
             continue
@@ -248,7 +312,6 @@ async def extract_trades_from_bytes(
     model_override: str | None = None,
 ) -> dict:
     """Extract trades from in-memory images (bytes, mime_type), merge by natural key."""
-    llm = _create_ocr_llm(model_override)
     prompt = format_ocr_trades()
 
     seen: set[tuple] = set()
@@ -257,7 +320,7 @@ async def extract_trades_from_bytes(
     min_confidence = 1.0
 
     for image_bytes, mime_type in images:
-        result = await _ocr_single_bytes(llm, prompt, image_bytes, mime_type)
+        result = await _ocr_bytes_with_fallback(prompt, image_bytes, mime_type, model_override)
         if not result:
             all_warnings.append("Failed to parse OCR result from image")
             continue

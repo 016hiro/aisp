@@ -28,6 +28,10 @@ case "$COMMAND" in
     morning)
         ${UV} run aisp --log-file "${LOG_FILE}" run-morning 2>&1 | tee -a "${LOG_FILE}"
         ;;
+    fetch-morning)
+        ${UV} run aisp --log-file "${LOG_FILE}" fetch-us 2>&1 | tee -a "${LOG_FILE}"
+        ${UV} run aisp --log-file "${LOG_FILE}" fetch-commodities 2>&1 | tee -a "${LOG_FILE}"
+        ;;
     close)
         ${UV} run aisp --log-file "${LOG_FILE}" run-close 2>&1 | tee -a "${LOG_FILE}"
         ;;

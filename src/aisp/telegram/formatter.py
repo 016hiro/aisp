@@ -5,10 +5,21 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+def _safe_float(val, default=None) -> float | None:
+    """Safely convert LLM output to float."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def format_positions_message(data: dict) -> str:
     """Format extracted positions as Telegram HTML message."""
     positions = data.get("positions") or []
-    confidence = data.get("confidence", 0)
+    confidence = _safe_float(data.get("confidence"), 0)
+
     snapshot_date = data.get("snapshot_date", "?")
 
     lines = [
@@ -21,9 +32,9 @@ def format_positions_message(data: dict) -> str:
         code = p.get("code", "?")
         name = p.get("name", "?")
         qty = p.get("quantity", "?")
-        cost = p.get("avg_cost")
-        pl_pct = p.get("profit_loss_pct")
-        cost_str = f"  成本:{cost:.2f}" if cost else ""
+        cost = _safe_float(p.get("avg_cost"))
+        pl_pct = _safe_float(p.get("profit_loss_pct"))
+        cost_str = f"  成本:{cost:.2f}" if cost is not None else ""
         pl_str = f"  盈亏:{pl_pct:+.2f}%" if pl_pct is not None else ""
         lines.append(f"<code>{code}</code> {name}  {qty}股{cost_str}{pl_str}")
 
@@ -36,7 +47,7 @@ def format_positions_message(data: dict) -> str:
 def format_trades_message(data: dict) -> str:
     """Format extracted trades as Telegram HTML message."""
     trades = data.get("trades") or []
-    confidence = data.get("confidence", 0)
+    confidence = _safe_float(data.get("confidence"), 0)
 
     lines = [
         f"<b>交割单识别结果</b>  ({len(trades)} 条)",
@@ -48,10 +59,10 @@ def format_trades_message(data: dict) -> str:
         code = t.get("code", "?")
         name = t.get("name", "?")
         direction = "买入" if t.get("trade_direction") == "buy" else "卖出"
-        price = t.get("price")
+        price = _safe_float(t.get("price"))
         qty = t.get("quantity", "?")
         trade_date = t.get("trade_date", "?")
-        price_str = f"@{price:.2f}" if price else ""
+        price_str = f"@{price:.2f}" if price is not None else ""
         lines.append(f"<code>{trade_date}</code> {direction} {code} {name} {qty}股{price_str}")
 
     for w in data.get("warnings") or []:

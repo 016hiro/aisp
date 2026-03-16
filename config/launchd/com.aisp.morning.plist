@@ -6,12 +6,12 @@
     <string>com.aisp.morning</string>
 
     <key>Comment</key>
-    <string>A-ISP morning pipeline: fetch-us/commodities/btc → screen → analyze → briefing</string>
+    <string>A-ISP morning data fetch: fetch-us + fetch-commodities (no LLM/briefing)</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/Users/lijunjie/github/aisp/config/cron.sh</string>
-        <string>morning</string>
+        <string>fetch-morning</string>
     </array>
 
     <key>WorkingDirectory</key>

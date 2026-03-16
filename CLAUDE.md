@@ -149,6 +149,13 @@ OpenRouter API with `asyncio.Semaphore(5)` concurrency control:
 - `sentiment_model` (cheap/fast): batch sentiment classification + watchlist NLP
 - `analysis_model` (strong): Agent-based per-stock deep analysis with tool access
 
+**Local-first fallback** (`LocalLLMConfig` in `config.py`, env prefix `AISP_LOCAL_LLM__*`):
+- Lightweight tasks (sentiment, watchlist NLP, OCR) try local LAN server first, fall back to remote OpenRouter on failure
+- httpx path: `LLMClient.chat(use_local=True)` → `_try_local()` → remote `_chat_with_retry()`
+- LangChain path (OCR): `_ocr_image_with_fallback()` / `_ocr_bytes_with_fallback()` → local `ChatOpenAI` → remote `ChatOpenAI`
+- Circuit breaker (`CircuitBreaker` / `local_breaker`): shared across httpx and LangChain paths, TTL-based (default 30s), prevents repeated connection waits in batch
+- Deep Agent analysis always uses remote (requires Claude-level reasoning + tool use)
+
 Prompts externalized in `config/prompts.toml`, loaded by `engine/prompts.py`. JSON parsing has three fallback layers: direct parse → markdown code block extraction → brace-matching regex. Parsing failure triggers auto-retry asking LLM for JSON reformat.
 
 ### Sentiment Adapter Pattern (`data/sources/`)
@@ -208,3 +215,13 @@ The goal is to verify the entire data → analysis → briefing chain produces c
 - **Ruff config**: target py313, line-length 100, isort with `aisp` as first-party
 - **Data dependencies are optional** — `yfinance` and `akshare` are in `[project.optional-dependencies].data`
 - **Graceful degradation** — fund flow and AkShare commodity fetches fail silently with warnings; missing `net_inflow` defaults to 0.5 factor score
+
+## Compact Instructions
+
+When compressing, preserve in priority order:
+
+1. Architecture decisions (NEVER summarize)
+2. Modified files and their key changes
+3. Current verification status (pass/fail)
+4. Open TODOs and rollback notes
+5. Tool outputs (can delete, keep pass/fail only)

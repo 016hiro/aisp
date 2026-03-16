@@ -81,9 +81,21 @@ AISP_BREAKOUT__VOL_CONFIRM_RATIO=1.5   # 放量确认基准
 AISP_TRADING_PLAN__ENABLED=true       # 是否启用交易计划
 AISP_TRADING_PLAN__ATR_PERIOD=20      # ATR 计算周期
 AISP_TRADING_PLAN__STOP_BUFFER_PCT=0.01  # 止损缓冲比例
+
+# 本地 LLM 服务器（可选，轻量任务优先走本地，不通时回退远程）
+AISP_LOCAL_LLM__ENABLED=true                          # 启用本地优先
+AISP_LOCAL_LLM__BASE_URL=http://192.168.1.84:8709/v1  # 局域网模型服务地址
+AISP_LOCAL_LLM__API_KEY=changeme-lan-key
+AISP_LOCAL_LLM__SENTIMENT_MODEL=qwen3.5-9b            # 文本推理（情感分类/Watchlist NLP）
+AISP_LOCAL_LLM__OCR_MODEL=qwen3.5-9b                  # 多模态 OCR，留空则 OCR 始终走远程
+AISP_LOCAL_LLM__CONNECT_TIMEOUT=3.0                   # 连接超时（快速失败）
+AISP_LOCAL_LLM__REQUEST_TIMEOUT=120.0                  # 推理超时
+AISP_LOCAL_LLM__CIRCUIT_BREAKER_TTL=30                 # 失败后跳过本地的秒数
 ```
 
 所有配置项均支持环境变量覆盖，前缀 `AISP_`，嵌套用 `__` 分隔。
+
+> **本地 LLM 路由策略**：情感分类、Watchlist NLP、OCR 优先走本地 LLM，连接失败或超时后自动回退远程 OpenRouter。Deep Agent 深度分析始终走远程（需要 Claude 级别推理 + 工具调用）。熔断器机制：本地失败后 30 秒内跳过，避免批量任务时反复等待连接超时。
 
 ## 使用方式
 

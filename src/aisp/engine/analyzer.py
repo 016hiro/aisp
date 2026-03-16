@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -68,6 +69,7 @@ async def classify_sentiment(trade_date: date) -> int:
                     results = await client.analyze_json(
                         messages,
                         model=client.sentiment_model,
+                        use_local=True,
                     )
 
                     if isinstance(results, list):
@@ -247,8 +249,37 @@ def _apply_direction_guardrails(
     return direction
 
 
+def _dump_prompt(prompt_dir: Path, code: str, name: str, user_prompt: str) -> None:
+    """Write system + user prompt to a file for external agent testing."""
+    from aisp.engine.agent import AGENT_TOOLS
+    from aisp.engine.prompts import get_template
+
+    system_prompt = get_template("agent_system")
+
+    tool_desc_lines = []
+    for t in AGENT_TOOLS:
+        tool_desc_lines.append(f"- {t.name}: {t.description}")
+    tools_section = "\n".join(tool_desc_lines)
+
+    content = (
+        f"# {name}({code}) — Agent 深度分析 Prompt\n\n"
+        f"## System Prompt\n\n{system_prompt}\n\n"
+        f"## Available Tools\n\n{tools_section}\n\n"
+        f"## User Prompt\n\n{user_prompt}\n"
+    )
+
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    path = prompt_dir / f"{code}.md"
+    path.write_text(content, encoding="utf-8")
+    logger.info("Prompt dumped: %s", path)
+
+
 async def run_analysis(
-    trade_date: date, *, btc_metrics=None, codes: list[str] | None = None
+    trade_date: date,
+    *,
+    btc_metrics=None,
+    codes: list[str] | None = None,
+    prompt_dir: Path | None = None,
 ) -> int:
     """Run full analysis pipeline: sentiment -> screening -> LLM analysis -> signals.
 
@@ -256,8 +287,9 @@ async def run_analysis(
         btc_metrics: Optional BtcRiskMetrics for global context enrichment.
         codes: Optional list of stock codes to analyze. If provided, only these
                stocks will be sent to LLM (screening still runs fully for ranking).
+        prompt_dir: If set, dump prompts to this directory instead of calling LLM.
 
-    Returns number of signals generated.
+    Returns number of signals generated (0 when dumping prompts).
     """
     get_settings()
 
@@ -412,6 +444,11 @@ async def run_analysis(
                     global_context=global_context_str,
                     sentiment_context=sentiment_cache.get(stock.code, "近期无相关舆情"),
                 )
+
+                # Dump mode: write prompt to file, skip LLM
+                if prompt_dir is not None:
+                    _dump_prompt(prompt_dir, stock.code, stock.name, prompt)
+                    return None
 
                 result = await analyze_stock(prompt)
 

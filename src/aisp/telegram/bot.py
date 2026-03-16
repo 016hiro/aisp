@@ -46,6 +46,8 @@ _EXT_MIME = {
     ".webp": "image/webp",
 }
 
+MAX_IMAGES_PER_BATCH = 20
+
 
 def _user_filter() -> filters.User | filters.ALL:
     """Build user filter from config. If no IDs configured, allow all."""
@@ -99,10 +101,21 @@ async def _begin_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def _receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle incoming photo (compressed) — download highest resolution."""
+    images = context.user_data.get("images", [])
+    if len(images) >= MAX_IMAGES_PER_BATCH:
+        await update.message.reply_text(
+            f"Maximum {MAX_IMAGES_PER_BATCH} images per batch. Send /done to process."
+        )
+        return WAITING_PHOTOS
+
     photo = update.message.photo[-1]  # highest resolution
-    file = await photo.get_file()
-    image_bytes = await file.download_as_bytearray()
-    image_bytes = bytes(image_bytes)
+    try:
+        file = await photo.get_file()
+        image_bytes = bytes(await file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download photo")
+        await update.message.reply_text("Failed to download image. Please resend.")
+        return WAITING_PHOTOS
 
     # SHA256 dedup
     h = compute_hash(image_bytes)
@@ -130,6 +143,13 @@ async def _receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def _receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle incoming document (uncompressed image file)."""
+    images = context.user_data.get("images", [])
+    if len(images) >= MAX_IMAGES_PER_BATCH:
+        await update.message.reply_text(
+            f"Maximum {MAX_IMAGES_PER_BATCH} images per batch. Send /done to process."
+        )
+        return WAITING_PHOTOS
+
     doc = update.message.document
     file_name = (doc.file_name or "").lower()
     ext = ""
@@ -143,9 +163,13 @@ async def _receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAITING_PHOTOS
 
     mime = _EXT_MIME[ext]
-    file = await doc.get_file()
-    image_bytes = await file.download_as_bytearray()
-    image_bytes = bytes(image_bytes)
+    try:
+        file = await doc.get_file()
+        image_bytes = bytes(await file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download document")
+        await update.message.reply_text("Failed to download file. Please resend.")
+        return WAITING_PHOTOS
 
     # SHA256 dedup
     h = compute_hash(image_bytes)
@@ -171,6 +195,18 @@ async def _receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return WAITING_PHOTOS
 
 
+async def _waiting_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected text in WAITING_PHOTOS state."""
+    await update.message.reply_text("Please send screenshots, or /done to process, /cancel to abort.")
+    return WAITING_PHOTOS
+
+
+async def _confirming_unexpected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages in CONFIRMING state."""
+    await update.message.reply_text("Please tap a button above to confirm, cancel, or change date.")
+    return CONFIRMING
+
+
 async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Process collected images with OCR."""
     images = context.user_data.get("images") or []
@@ -183,43 +219,50 @@ async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Processing {len(images)} image{'s' if len(images) > 1 else ''} with OCR..."
     )
 
-    settings = get_settings()
-    model = settings.openrouter.analysis_model
-
     try:
         if mode == "positions":
             from aisp.portfolio.ocr import extract_positions_from_bytes
 
-            data = await extract_positions_from_bytes(images, model_override=model)
+            data = await extract_positions_from_bytes(images)
             items = data.get("positions") or []
         else:
             from aisp.portfolio.ocr import extract_trades_from_bytes
 
-            data = await extract_trades_from_bytes(images, model_override=model)
+            data = await extract_trades_from_bytes(images)
             items = data.get("trades") or []
     except Exception:
         logger.exception("OCR failed")
         await update.message.reply_text("OCR processing failed. Please try again.")
+        _clear_user_data(context)
         return ConversationHandler.END
 
     if not items:
         await update.message.reply_text("No data extracted from screenshots.")
+        _clear_user_data(context)
         return ConversationHandler.END
 
     # Store OCR result for confirmation
     context.user_data["ocr_data"] = data
 
     # Format preview
-    if mode == "positions":
-        snapshot_date = data.get("snapshot_date", date.today().isoformat())
-        msg = format_positions_message(data)
-        keyboard = build_confirm_keyboard("positions", snapshot_date)
-    else:
-        # Use first trade's date or today
-        trades = data.get("trades") or []
-        first_date = trades[0].get("trade_date", date.today().isoformat()) if trades else ""
-        msg = format_trades_message(data)
-        keyboard = build_confirm_keyboard("trades", first_date)
+    try:
+        if mode == "positions":
+            snapshot_date = data.get("snapshot_date", date.today().isoformat())
+            msg = format_positions_message(data)
+            keyboard = build_confirm_keyboard("positions", snapshot_date)
+        else:
+            # Use first trade's date or today
+            trades = data.get("trades") or []
+            first_date = (
+                trades[0].get("trade_date", date.today().isoformat()) if trades else ""
+            )
+            msg = format_trades_message(data)
+            keyboard = build_confirm_keyboard("trades", first_date)
+    except Exception:
+        logger.exception("Failed to format OCR result")
+        await update.message.reply_text("OCR result format error. Please try again.")
+        _clear_user_data(context)
+        return ConversationHandler.END
 
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
     return CONFIRMING
@@ -247,6 +290,7 @@ async def _callback_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception:
         logger.exception("DB import failed")
         await query.edit_message_text("Import failed. Please try again.")
+        _clear_user_data(context)
         return ConversationHandler.END
 
     # Record image hashes
@@ -345,12 +389,19 @@ def create_application() -> Application:
             WAITING_PHOTOS: [
                 MessageHandler(filters.PHOTO & user_filter, _receive_photo),
                 MessageHandler(filters.Document.ALL & user_filter, _receive_document),
-                CommandHandler("done", _done),
+                CommandHandler("done", _done, filters=user_filter),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & user_filter, _waiting_text
+                ),
             ],
             CONFIRMING: [
                 CallbackQueryHandler(_callback_confirm, pattern=r"^confirm:"),
                 CallbackQueryHandler(_callback_cancel, pattern=r"^cancel$"),
                 CallbackQueryHandler(_callback_change_date, pattern=r"^change_date:"),
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.Document.ALL) & user_filter,
+                    _confirming_unexpected,
+                ),
             ],
             CHANGING_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, _receive_date),

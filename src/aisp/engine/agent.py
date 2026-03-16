@@ -193,7 +193,8 @@ def _extract_last_ai_text(result: dict) -> str | None:
 
 def _parse_agent_json(text: str) -> dict | None:
     """Parse JSON from agent response with fallbacks."""
-    text = text.strip()
+    # Strip thinking blocks from reasoning models (e.g. Qwen3)
+    text = re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL).strip()
 
     # Direct parse
     try:

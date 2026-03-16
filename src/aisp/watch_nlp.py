@@ -47,6 +47,7 @@ async def handle_watch_query(query: str) -> list[str]:
         result = await client.analyze_json(
             [{"role": "user", "content": prompt}],
             model=client.sentiment_model,
+            use_local=True,
         )
     finally:
         await client.close()

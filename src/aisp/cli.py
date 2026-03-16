@@ -346,6 +346,51 @@ def run_analysis_pipeline(
 
 
 @app.command()
+def dump_prompts(
+    trade_date: str | None = typer.Option(None, help="Date YYYY-MM-DD, default today"),
+    codes: str | None = typer.Option(None, help="Comma-separated stock codes (default: watchlist)"),
+    output_dir: str = typer.Option("prompts", "--output", "-o", help="Output directory"),
+):
+    """Dump Agent analysis prompts to files (no LLM call).
+
+    Runs the full screening pipeline, then writes each stock's complete prompt
+    (system + tools + user) to a markdown file for testing in other agent systems.
+    """
+    from aisp.data.symbols import load_cn_watchlist
+    from aisp.engine.analyzer import run_analysis
+
+    dt = date.fromisoformat(trade_date) if trade_date else date.today()
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        watchlist = load_cn_watchlist()
+        code_list = [item["code"] for item in watchlist] if watchlist else None
+        if code_list:
+            console.print(f"[dim]Watchlist: {len(code_list)} stocks[/dim]")
+
+    prompt_path = Path(output_dir) / str(dt)
+
+    async def _pipeline():
+        await _ensure_cn_data(dt, code_list)
+        await _ensure_global_data(dt)
+
+        console.print("[bold]Step 1/2: Running sector screening...[/bold]")
+        from aisp.screening.sector_pools import SectorPoolManager
+        from aisp.screening.stock_scorer import StockScorer
+
+        pool_mgr = SectorPoolManager()
+        pools = await pool_mgr.update_pools(dt)
+        scorer = StockScorer()
+        await scorer.score_all_pools(pools, dt)
+
+        console.print("[bold]Step 2/2: Dumping prompts...[/bold]")
+        await run_analysis(dt, codes=code_list, prompt_dir=prompt_path)
+
+    _run(_pipeline())
+    console.print(f"[bold green]Prompts saved to {prompt_path}/[/bold green]")
+
+
+@app.command()
 def run_morning(
     trade_date: str | None = typer.Option(None, help="Date YYYY-MM-DD, default today"),
 ):

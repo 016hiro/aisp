@@ -99,6 +99,19 @@ class TradingPlanConfig(BaseModel):
     normal_atr_multiplier: float = 1.0
 
 
+class LocalLLMConfig(BaseModel):
+    """本地 LLM 服务器（OpenAI API 兼容），轻量任务优先走本地。"""
+
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = "not-needed"
+    sentiment_model: str = ""
+    ocr_model: str = ""
+    connect_timeout: float = 3.0
+    request_timeout: float = 120.0
+    circuit_breaker_ttl: int = 30
+
+
 class OcrConfig(BaseModel):
     """OCR extraction via multimodal LLM."""
 
@@ -146,6 +159,7 @@ class Settings(BaseSettings):
 
     db: DatabaseConfig = Field(default_factory=DatabaseConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
+    local_llm: LocalLLMConfig = Field(default_factory=LocalLLMConfig)
     scoring: ScoringWeights = Field(default_factory=ScoringWeights)
     veto: VetoConfig = Field(default_factory=VetoConfig)
     wyckoff: WyckoffConfig = Field(default_factory=WyckoffConfig)
