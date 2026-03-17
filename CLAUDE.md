@@ -13,6 +13,9 @@ uv run aisp init-db              # Create/migrate SQLite tables
 uv run aisp fetch-us [--trade-date YYYY-MM-DD]
 uv run aisp fetch-commodities [--trade-date YYYY-MM-DD]
 uv run aisp fetch-cn [--trade-date YYYY-MM-DD]          # 默认 watchlist 模式，--mode full 全量
+uv run aisp fetch-extra [--trade-date YYYY-MM-DD] [--codes ...]  # 情绪+资金分层+龙虎榜+融资融券
+uv run aisp fetch-profile [--codes ...]                          # 股本结构（季度运行）
+uv run aisp fetch-quarterly <year> <quarter> [--codes ...]       # 季度财报
 
 # Analysis pipeline
 uv run aisp screen [--trade-date YYYY-MM-DD]
@@ -90,6 +93,8 @@ Stocks ranked within sector using 8 factors with elastic weights (extreme factor
 - Veto rules: macro<0.15 or sentiment<0.10 → block buy; sentiment>0.95 → warn
 - Two paths: `score_all_pools()` (batch, top-N per sector) vs `score_by_codes()` (targeted, no top-N)
 - Trend detection: `_compute_trend(closes)` stores consecutive down days, cumulative decline %, MA5 vs MA20 in `raw_data["_trend"]`
+- Position info: `_compute_position_info(closes, turnovers)` → distances from 60/120-day highs/lows, YTD %, cumulative turnover in `raw_data["_position_info"]`
+- Extended context: `raw_data["_profile"]` (board type, liq shares), `raw_data["_lhb"]` (LHB net buy/reason), `raw_data["_margin"]` (margin balances) — injected into LLM prompt but NOT into 8-factor scoring
 
 Supporting modules: `screening/indicators.py` (RSI/MACD/MA pure functions), `screening/factor_engine.py` (elastic weights + veto engine)
 
@@ -158,6 +163,32 @@ OpenRouter API with `asyncio.Semaphore(5)` concurrency control:
 
 Prompts externalized in `config/prompts.toml`, loaded by `engine/prompts.py`. JSON parsing has three fallback layers: direct parse → markdown code block extraction → brace-matching regex. Parsing failure triggers auto-retry asking LLM for JSON reformat.
 
+### Extended Market Data (`data/market_data.py`)
+
+6 fetch functions following cn_market.py pattern (`asyncio.to_thread()` + `@with_retry` + `sqlite_upsert`):
+
+| Function | Data Source | Target Table | Frequency |
+|----------|-----------|--------------|-----------|
+| `fetch_market_sentiment(date)` | AkShare `stock_zt_pool_em` + `stock_market_activity_legu` | market_sentiment | Daily |
+| `fetch_fund_flow(codes)` | AkShare `stock_individual_fund_flow` | stk_daily (update) | Daily/stock |
+| `fetch_stk_profile(codes)` | BaoStock `query_stock_basic` | stk_profile | Quarterly |
+| `fetch_stk_quarterly(codes, year, quarter)` | BaoStock `query_profit_data` + `query_growth_data` | stk_quarterly | Quarterly |
+| `fetch_lhb(date)` | AkShare `stock_lhb_detail_em` | stk_lhb | Daily |
+| `fetch_margin(codes, date)` | AkShare `stock_margin_detail_info` | stk_margin | Daily |
+
+All functions graceful degradation: API failure → warning + skip, never blocks pipeline.
+
+### Prompt Enrichment (`engine/prompts.py`)
+
+5 new format functions for LLM context injection:
+- `format_market_sentiment(row)` → "两市成交1.2万亿 | 涨停78(实板52) | 炸板率33%"
+- `format_stock_identity(profile, pe, pb)` → "创业板 | 流通58亿 | PE(TTM)25.3"
+- `format_fund_flow_detail(data)` → markdown table (超大单/大单/中单/小单)
+- `format_position_info(info)` → "距60日高-15.3% | YTD -5.3%"
+- `format_lhb_info(data)` → "龙虎榜: 净买+2345万 | 原因: 涨幅偏离>7%"
+
+Agent system prompt (`config/prompts.toml`) extended with interpretation rules for sentiment cycles, fund flow reading, price position analysis, and LHB signals.
+
 ### Sentiment Adapter Pattern (`data/sources/`)
 
 New data sources implement `DataSourceAdapter` and use `@register_adapter` decorator. The registry auto-discovers adapters at import time.
@@ -183,13 +214,15 @@ Screenshot OCR import via Telegram — replaces manual `import-positions`/`impor
 - Config: `TelegramConfig` in `config.py`, env prefix `AISP_TELEGRAM__*`
 - Daemon: `com.aisp.telegram.plist` with `KeepAlive: true`
 
-### Database (13 tables in `db/models.py`)
+### Database (18 tables in `db/models.py`)
 
 All writes use SQLite upsert (`on_conflict_do_update`) for idempotency. Batch inserts use 500-row chunks. Async via `aiosqlite` + `greenlet`.
 
 Key enums (all `StrEnum`): `Direction` (strong_buy/buy/weak_buy/hold/watch/weak_sell/sell/strong_sell), `Sentiment` (7 values including pending), `PoolType` (core/momentum/opportunity), `Evaluation` (correct/wrong/neutral/pending), `TradeDirection` (buy/sell), `ImportSource` (ocr/manual/telegram).
 
-New tables: `position_snapshot` (daily snapshot, unique on `(snapshot_date, code)`), `trade_record` (unique on `(trade_date, code, direction, price, quantity)`), and `image_hash` (SHA256 dedup for Telegram bot, unique on `hash`).
+Portfolio tables: `position_snapshot` (daily snapshot, unique on `(snapshot_date, code)`), `trade_record` (unique on `(trade_date, code, direction, price, quantity)`), and `image_hash` (SHA256 dedup for Telegram bot, unique on `hash`).
+
+Extended data tables: `market_sentiment` (unique on `trade_date`), `stk_profile` (unique on `code`), `stk_quarterly` (unique on `(code, year, quarter)`), `stk_lhb` (unique on `(trade_date, code)`), `stk_margin` (unique on `(trade_date, code)`). StkDaily extended with 12 new columns: 10 fund flow (main/super_large/large/medium/small net+pct) + 2 valuation (pe_ttm, pb_mrq). Migration via `_migrate_stk_daily_v2()` in `engine.py`.
 
 ### Configuration (`config.py`)
 

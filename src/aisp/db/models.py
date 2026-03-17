@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.0 async models — 13 tables for A-ISP."""
+"""SQLAlchemy 2.0 async models — 18 tables for A-ISP."""
 
 from __future__ import annotations
 
@@ -111,6 +111,22 @@ class StkDaily(Base):
     volume_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     net_inflow: Mapped[float | None] = mapped_column(Float, nullable=True)
     market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 资金分层 (fund flow breakdown)
+    main_net: Mapped[float | None] = mapped_column(Float, nullable=True)
+    main_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    super_large_net: Mapped[float | None] = mapped_column(Float, nullable=True)
+    super_large_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    large_net: Mapped[float | None] = mapped_column(Float, nullable=True)
+    large_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    medium_net: Mapped[float | None] = mapped_column(Float, nullable=True)
+    medium_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    small_net: Mapped[float | None] = mapped_column(Float, nullable=True)
+    small_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 估值 (valuation)
+    pe_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pb_mrq: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     is_st: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_limit_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -408,3 +424,117 @@ class ImageHash(Base):
     source_type: Mapped[str] = mapped_column(String(20), nullable=False)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     processed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# ── 14. market_sentiment ─────────────────────────────────
+
+
+class MarketSentiment(Base):
+    __tablename__ = "market_sentiment"
+    __table_args__ = (
+        UniqueConstraint("trade_date", name="uq_market_sentiment_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    total_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    limit_up_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    limit_down_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    real_limit_up: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blast_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_streak: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    prev_zt_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    activity_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ── 15. stk_profile ──────────────────────────────────────
+
+
+class StkProfile(Base):
+    __tablename__ = "stk_profile"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_stk_profile_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    board_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    total_shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liq_shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+    listing_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# ── 16. stk_quarterly ────────────────────────────────────
+
+
+class StkQuarterly(Base):
+    __tablename__ = "stk_quarterly"
+    __table_args__ = (
+        UniqueConstraint("code", "year", "quarter", name="uq_stk_quarterly_code_yq"),
+        Index("ix_stk_quarterly_code", "code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    quarter: Mapped[int] = mapped_column(Integer, nullable=False)
+    net_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    np_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gp_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    roe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    eps_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yoy_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yoy_eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yoy_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pub_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# ── 17. stk_lhb ─────────────────────────────────────────
+
+
+class StkLhb(Base):
+    __tablename__ = "stk_lhb"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "code", name="uq_stk_lhb_date_code"),
+        Index("ix_stk_lhb_trade_date", "trade_date"),
+        Index("ix_stk_lhb_code", "code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    net_buy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    buy_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sell_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    turnover_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liq_market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    post_1d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    post_2d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    post_5d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    post_10d: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ── 18. stk_margin ───────────────────────────────────────
+
+
+class StkMargin(Base):
+    __tablename__ = "stk_margin"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "code", name="uq_stk_margin_date_code"),
+        Index("ix_stk_margin_trade_date", "trade_date"),
+        Index("ix_stk_margin_code", "code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    code: Mapped[str] = mapped_column(String(10), nullable=False)
+    rzye: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rzjme: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rqyl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rqjmg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rzrqye: Mapped[float | None] = mapped_column(Float, nullable=True)

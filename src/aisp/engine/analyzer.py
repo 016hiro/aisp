@@ -14,12 +14,24 @@ from aisp.db.engine import get_engine, get_session_factory
 from aisp.db.models import (
     Direction,
     GlobalDaily,
+    MarketSentiment,
     SectorDaily,
     Sentiment,
     StkComments,
 )
 from aisp.engine.llm_client import LLMClient
-from aisp.engine.prompts import format_sentiment_classification, format_stock_analysis
+from aisp.engine.prompts import (
+    format_factor_table,
+    format_fund_flow_detail,
+    format_kline_history,
+    format_lhb_info,
+    format_market_sentiment,
+    format_position_info,
+    format_sentiment_classification,
+    format_stock_analysis,
+    format_stock_identity,
+    format_trend_summary,
+)
 from aisp.engine.signals import generate_signals
 from aisp.screening.sector_pools import SectorPoolManager
 from aisp.screening.stock_scorer import GlobalContext, StockScorer
@@ -121,24 +133,6 @@ async def _get_sector_context(session, sector_name: str, trade_date: date) -> st
     )
 
 
-async def _get_global_context(session, trade_date: date) -> str:
-    """Build global market context string."""
-    result = await session.execute(
-        select(GlobalDaily)
-        .where(GlobalDaily.trade_date <= trade_date)
-        .order_by(GlobalDaily.trade_date.desc())
-        .limit(20)
-    )
-    globals_ = result.scalars().all()
-    if not globals_:
-        return "全球市场数据不可用"
-
-    lines = []
-    for g in globals_:
-        lines.append(f"{g.name}({g.symbol}): {g.close} ({g.change_pct:+.2f}%)")
-    return "\n".join(lines[:10])
-
-
 async def _get_sentiment_context(session, code: str, trade_date: date) -> str:
     """Build sentiment context for a stock."""
     from datetime import timedelta
@@ -202,6 +196,30 @@ def _merge_trading_plans(quant: dict | None, llm: dict | None) -> dict | None:
     return merged
 
 
+def _get_filtered_global_context(
+    global_rows: list, sector_name: str, settings
+) -> tuple[str, str]:
+    """Filter global data by sector linkage. Return (context_str, data_quality_tag)."""
+    # Reverse mapping: sector → [global_symbols]
+    reverse: dict[str, list[str]] = {}
+    for symbol, sectors in settings.asset_linkage.mapping.items():
+        for s in sectors:
+            reverse.setdefault(s, []).append(symbol)
+
+    linked_symbols = reverse.get(sector_name, [])
+    if linked_symbols:
+        filtered = [g for g in global_rows if g.symbol in linked_symbols]
+        quality = f"[{len(filtered)}只关联资产]"
+    else:
+        # No linkage → only major indices
+        idx_symbols = {"^GSPC", "^IXIC", "^DJI"}
+        filtered = [g for g in global_rows if g.symbol in idx_symbols]
+        quality = "[无直接关联，仅大盘]"
+
+    lines = [f"{g.name}({g.symbol}): {g.close} ({g.change_pct:+.2f}%)" for g in filtered]
+    return "\n".join(lines) or "全球数据不可用", quality
+
+
 _BULLISH_DOWNGRADE = {
     Direction.STRONG_BUY: Direction.BUY,
     Direction.BUY: Direction.WEAK_BUY,
@@ -254,7 +272,9 @@ def _dump_prompt(prompt_dir: Path, code: str, name: str, user_prompt: str) -> No
     from aisp.engine.agent import AGENT_TOOLS
     from aisp.engine.prompts import get_template
 
-    system_prompt = get_template("agent_system")
+    system_prompt = get_template("agent_system").format(
+        output_schema=get_template("output_schema"),
+    )
 
     tool_desc_lines = []
     for t in AGENT_TOOLS:
@@ -345,11 +365,20 @@ async def run_analysis(
     semaphore = asyncio.Semaphore(5)
 
     # Pre-fetch all context data (DB queries must be sequential)
+    settings = get_settings()
     async with session_factory() as session:
         sector_context_cache: dict[str, str] = {}
-        global_context_str = await _get_global_context(session, trade_date)
-        if btc_metrics is not None:
-            global_context_str += btc_metrics.to_prompt_text()
+        # Fetch global rows for filtered context
+        global_daily_q2 = await session.execute(
+            select(GlobalDaily).where(GlobalDaily.trade_date == trade_date)
+        )
+        global_rows_cache = global_daily_q2.scalars().all()
+
+        # Fetch market sentiment (shared across all stocks)
+        market_sent_q = await session.execute(
+            select(MarketSentiment).where(MarketSentiment.trade_date == trade_date)
+        )
+        market_sentiment_row = market_sent_q.scalar_one_or_none()
 
         for stock in scored_stocks:
             if stock.sector not in sector_context_cache:
@@ -377,9 +406,8 @@ async def run_analysis(
                 if wyckoff_data and wyckoff_data.get("phase") != "unknown":
                     extra_instructions = (
                         f"\n## 威科夫阶段分析\n{wyckoff_data['detail']}\n"
-                        f"- 请结合威科夫{wyckoff_data['phase']}阶段判断，"
-                        f"校准乘数为{wyckoff_data['multiplier']}，"
-                        f"已自动调整综合得分"
+                        f"- 威科夫{wyckoff_data['phase']}阶段，"
+                        f"校准乘数{wyckoff_data['multiplier']}，已调整综合得分"
                     )
 
                 breakout_data = stock.raw_data.get("_breakout")
@@ -388,18 +416,25 @@ async def run_analysis(
                     extra_instructions += (
                         "\n## 突破信号\n"
                         + "\n".join(f"- {t}" for t in breakout_lines)
-                        + "\n- 请重点关注上述突破信号对短期走势的影响"
                     )
 
                 trading_plan = stock.raw_data.get("_trading_plan")
                 if trading_plan and trading_plan.get("entry_zone"):
                     ez = trading_plan["entry_zone"]
+                    short_targets = trading_plan.get("targets", [])
+                    mid_targets = trading_plan.get("mid_targets", [])
+                    short_rr = trading_plan.get("risk_reward", 0)
+                    mid_rr = trading_plan.get("mid_risk_reward", 0)
                     extra_instructions += (
                         "\n## 量化交易计划（请验证并调整）\n"
                         f"- 入场区间: {ez[0]:.2f} - {ez[1]:.2f}\n"
                         f"- 止损位: {trading_plan['stop_loss']:.2f}\n"
-                        f"- 目标位: {', '.join(f'{t:.2f}' for t in trading_plan['targets'])}\n"
-                        f"- 风险收益比: {trading_plan['risk_reward']:.1f}\n"
+                        f"- 短线目标(1-5日): "
+                        f"{', '.join(f'{t:.2f}' for t in short_targets)}"
+                        f" | R:R {short_rr:.1f}\n"
+                        f"- 中线目标(1-3月): "
+                        f"{', '.join(f'{t:.2f}' for t in mid_targets)}"
+                        f" | R:R {mid_rr:.1f}\n"
                         f"- 涨停/跌停: {trading_plan['price_limits']['down']:.2f}"
                         f" ~ {trading_plan['price_limits']['up']:.2f}\n"
                         f"- {trading_plan['t1_note']}\n"
@@ -409,6 +444,40 @@ async def run_analysis(
                         f"\n## 交易提示\n- {trading_plan.get('rationale', '')}\n"
                     )
 
+                # Build enriched prompt fields
+                recent_ohlcv = stock.raw_data.get("_recent_ohlcv", [])
+                kline_history = format_kline_history(recent_ohlcv)
+                kline_quality = (
+                    f"[{len(recent_ohlcv)}根]" if recent_ohlcv else "[数据不可用]"
+                )
+
+                trend_summary = format_trend_summary(stock.raw_data.get("_trend", {}))
+
+                factor_table = format_factor_table(
+                    stock.factor_scores,
+                    stock.dynamic_weights,
+                    raw_indicators=stock.raw_data.get("_raw_indicators"),
+                )
+
+                filtered_ctx, global_quality = _get_filtered_global_context(
+                    global_rows_cache, stock.sector, settings
+                )
+                # Append BTC metrics if available
+                if btc_metrics is not None:
+                    filtered_ctx += btc_metrics.to_prompt_text()
+
+                # New enriched fields
+                market_sent_str = format_market_sentiment(market_sentiment_row)
+                stock_id_str = format_stock_identity(
+                    stock.raw_data.get("_profile"),
+                    stock.raw_data.get("pe_ttm"),
+                    stock.raw_data.get("pb_mrq"),
+                    close=stock.raw_data.get("close"),
+                )
+                fund_flow_str = format_fund_flow_detail(stock.raw_data)
+                position_str = format_position_info(stock.raw_data.get("_position_info"))
+                lhb_str = format_lhb_info(stock.raw_data.get("_lhb"))
+
                 prompt = format_stock_analysis(
                     code=stock.code,
                     name=stock.name,
@@ -416,33 +485,24 @@ async def run_analysis(
                     pool_type=stock.pool_type.value,
                     close=stock.raw_data.get("close", "N/A"),
                     change_pct=stock.raw_data.get("change_pct", "N/A"),
-                    volume=stock.raw_data.get("volume", "N/A"),
-                    amount=stock.raw_data.get("amount", "N/A"),
                     turnover_rate=stock.raw_data.get("turnover_rate", "N/A"),
                     volume_ratio=stock.raw_data.get("volume_ratio", "N/A"),
-                    net_inflow=stock.raw_data.get("net_inflow", "N/A"),
                     total_score=stock.total_score,
-                    f_fund=stock.factor_scores.get("fund", 0.5),
-                    f_momentum=stock.factor_scores.get("momentum", 0.5),
-                    f_technical=stock.factor_scores.get("technical", 0.5),
-                    f_quality=stock.factor_scores.get("quality", 0.5),
-                    f_indicators=stock.factor_scores.get("indicators", 0.5),
-                    f_macro=stock.factor_scores.get("macro", 0.5),
-                    f_sentiment=stock.factor_scores.get("sentiment", 0.5),
-                    f_sector=stock.factor_scores.get("sector", 0.5),
-                    w_fund=stock.dynamic_weights.get("fund", 0),
-                    w_momentum=stock.dynamic_weights.get("momentum", 0),
-                    w_technical=stock.dynamic_weights.get("technical", 0),
-                    w_quality=stock.dynamic_weights.get("quality", 0),
-                    w_indicators=stock.dynamic_weights.get("indicators", 0),
-                    w_macro=stock.dynamic_weights.get("macro", 0),
-                    w_sentiment=stock.dynamic_weights.get("sentiment", 0),
-                    w_sector=stock.dynamic_weights.get("sector", 0),
+                    kline_history=kline_history,
+                    kline_data_quality=kline_quality,
+                    trend_summary=trend_summary,
+                    factor_table=factor_table,
                     veto_warning=veto_warning,
                     extra_instructions=extra_instructions,
                     sector_context=sector_context_cache[stock.sector],
-                    global_context=global_context_str,
+                    filtered_global_context=filtered_ctx,
+                    global_data_quality=global_quality,
                     sentiment_context=sentiment_cache.get(stock.code, "近期无相关舆情"),
+                    stock_identity=stock_id_str,
+                    market_sentiment=market_sent_str,
+                    position_info=position_str,
+                    fund_flow_detail=fund_flow_str,
+                    lhb_info=lhb_str,
                 )
 
                 # Dump mode: write prompt to file, skip LLM

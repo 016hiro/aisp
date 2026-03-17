@@ -143,14 +143,13 @@ def _fetch_stock_daily_sync(
     """Fetch daily K-line data for given codes.
 
     Returns records for ALL dates in the lookback range (for historical indicator
-    computation). volume_ratio is only computed for the target_date row.
+    computation). volume_ratio is computed for all rows (today_vol / avg of prev 5 days).
     """
     import baostock as bs
 
     start_str = (trade_date - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     end_str = trade_date.strftime("%Y-%m-%d")
-    target_str = end_str
-    fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg,turn,isST"
+    fields = "date,code,open,high,low,close,preclose,volume,amount,pctChg,turn,isST,peTTM,pbMRQ"
 
     results: list[dict] = []
     total = len(codes)
@@ -197,16 +196,15 @@ def _fetch_stock_daily_sync(
                 is_st_flag = row[11] == "1" if len(row) > 11 else False
                 st_name = "ST" if is_st_flag else ""
 
-                # volume_ratio only for target date
+                # volume_ratio: today_vol / avg of previous 5 trading days
                 volume_ratio = None
-                if row_date_str == target_str:
-                    today_vol = _safe_float(row[7])
-                    prev_vols = [v for d, v in all_volumes if d < target_str]
-                    if today_vol and prev_vols:
-                        recent = prev_vols[-5:]
-                        avg_vol = sum(recent) / len(recent)
-                        if avg_vol > 0:
-                            volume_ratio = today_vol / avg_vol
+                today_vol = _safe_float(row[7])
+                prev_vols = [v for d, v in all_volumes if d < row_date_str]
+                if today_vol and prev_vols:
+                    recent = prev_vols[-5:]
+                    avg_vol = sum(recent) / len(recent)
+                    if avg_vol > 0:
+                        volume_ratio = today_vol / avg_vol
 
                 results.append({
                     "code": _from_bs_code(row[1]),
@@ -223,6 +221,8 @@ def _fetch_stock_daily_sync(
                     "volume_ratio": volume_ratio,
                     "net_inflow": None,
                     "market_cap": None,
+                    "pe_ttm": _safe_float(row[12]) if len(row) > 12 else None,
+                    "pb_mrq": _safe_float(row[13]) if len(row) > 13 else None,
                     "is_st": is_st_flag,
                     "is_limit_up": _is_limit_up(change_pct, st_name),
                     "is_limit_down": _is_limit_down(change_pct, st_name),

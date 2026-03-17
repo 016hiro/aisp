@@ -18,6 +18,9 @@ from aisp.db.models import (
     Sentiment,
     StkComments,
     StkDaily,
+    StkLhb,
+    StkMargin,
+    StkProfile,
     StkSectorMap,
 )
 from aisp.screening.factor_engine import FactorResult, VetoRule, score_stock
@@ -261,6 +264,45 @@ class StockScorer:
             )
             sector_daily = sector_daily_q.scalar_one_or_none()
 
+            # ── Stock profiles ──
+            profile_q = await session.execute(
+                select(StkProfile).where(StkProfile.code.in_(stock_codes))
+            )
+            profile_map = {p.code: p for p in profile_q.scalars().all()}
+
+            # ── LHB (today) ──
+            lhb_q = await session.execute(
+                select(StkLhb).where(
+                    StkLhb.trade_date == trade_date,
+                    StkLhb.code.in_(stock_codes),
+                )
+            )
+            lhb_map = {row.code: row for row in lhb_q.scalars().all()}
+
+            # ── Margin (today) ──
+            margin_q = await session.execute(
+                select(StkMargin).where(
+                    StkMargin.trade_date == trade_date,
+                    StkMargin.code.in_(stock_codes),
+                )
+            )
+            margin_map = {m.code: m for m in margin_q.scalars().all()}
+
+            # ── Turnover history for position info ──
+            turnover_q = await session.execute(
+                select(StkDaily.code, StkDaily.trade_date, StkDaily.turnover_rate)
+                .where(
+                    StkDaily.code.in_(stock_codes),
+                    StkDaily.trade_date >= cutoff,
+                    StkDaily.trade_date <= trade_date,
+                )
+                .order_by(StkDaily.trade_date)
+            )
+            turnover_by_code: dict[str, list[float]] = {}
+            for code, _, tr in turnover_q.all():
+                if tr is not None:
+                    turnover_by_code.setdefault(code, []).append(float(tr))
+
         await engine.dispose()
 
         # Build raw data for ranking
@@ -281,6 +323,19 @@ class StockScorer:
                 "close": s.close,
                 "volume": s.volume,
                 "amount": s.amount,
+                # Fund flow breakdown (for prompt enrichment, not scoring)
+                "main_net": s.main_net,
+                "main_pct": s.main_pct,
+                "super_large_net": s.super_large_net,
+                "super_large_pct": s.super_large_pct,
+                "large_net": s.large_net,
+                "large_pct": s.large_pct,
+                "medium_net": s.medium_net,
+                "medium_pct": s.medium_pct,
+                "small_net": s.small_net,
+                "small_pct": s.small_pct,
+                "pe_ttm": s.pe_ttm,
+                "pb_mrq": s.pb_mrq,
             })
 
         n = len(stock_data)
@@ -319,6 +374,18 @@ class StockScorer:
             if sector_daily:
                 ma_values = {5: sector_daily.ma5, 10: sector_daily.ma10, 20: sector_daily.ma20, 60: sector_daily.ma60}
             factor_indicators = compute_technical_score(closes, ma_values)
+
+            # Raw indicator values for LLM prompt enrichment
+            from aisp.screening.indicators import compute_macd, compute_rsi
+
+            raw_rsi = compute_rsi(closes)
+            raw_macd = compute_macd(closes)
+            raw_indicators = {
+                "rsi6": round(raw_rsi, 1) if raw_rsi is not None else None,
+                "macd": round(raw_macd["macd"], 4) if raw_macd else None,
+                "macd_signal": round(raw_macd["signal"], 4) if raw_macd else None,
+                "macd_hist": round(raw_macd["histogram"], 4) if raw_macd else None,
+            }
 
             # Sentiment factor
             factor_sentiment = _compute_sentiment_score(sent_by_code.get(d["code"], []))
@@ -424,6 +491,33 @@ class StockScorer:
             # ── Trend detection (for direction override) ──
             trend_info = _compute_trend(closes)
 
+            # Recent OHLCV for LLM K-line display (last 15 bars)
+            bars = ohlcv_by_code.get(d["code"], [])
+            recent_bars = bars[-15:] if len(bars) >= 15 else bars
+            recent_ohlcv = [
+                {
+                    "o": round(b.open, 2),
+                    "h": round(b.high, 2),
+                    "l": round(b.low, 2),
+                    "c": round(b.close, 2),
+                    "v": int(b.volume),
+                }
+                for b in recent_bars
+            ]
+
+            # ── Volume ratio fallback (compute from lookback if DB is NULL) ──
+            if d.get("volume_ratio") is None:
+                bars_for_vr = ohlcv_by_code.get(d["code"], [])
+                if len(bars_for_vr) >= 6:
+                    today_vol = bars_for_vr[-1].volume
+                    avg_vol = sum(b.volume for b in bars_for_vr[-6:-1]) / 5
+                    if avg_vol > 0:
+                        d["volume_ratio"] = round(today_vol / avg_vol, 4)
+
+            # ── Position info (price location context) ──
+            turnovers = turnover_by_code.get(d["code"], [])
+            position_info = _compute_position_info(closes, turnovers)
+
             scored.append(ScoredStock(
                 code=d["code"],
                 name=d["name"],
@@ -439,6 +533,12 @@ class StockScorer:
                     "_breakout": breakout_strong or None,
                     "_trading_plan": trading_plan_dict,
                     "_trend": trend_info,
+                    "_recent_ohlcv": recent_ohlcv,
+                    "_raw_indicators": raw_indicators,
+                    "_position_info": position_info,
+                    "_profile": _profile_to_dict(profile_map.get(d["code"])),
+                    "_lhb": _lhb_to_dict(lhb_map.get(d["code"])),
+                    "_margin": _margin_to_dict(margin_map.get(d["code"])),
                 },
                 wyckoff_phase=wyckoff_result.phase.value if wyckoff_result else None,
                 wyckoff_multiplier=wyckoff_result.multiplier if wyckoff_result else 1.0,
@@ -619,3 +719,92 @@ def _turnover_suitability(turnover_rates: list[float | None]) -> list[float]:
         else:
             result.append(max(0.0, 1.0 - (tr - 8.0) / 20.0))
     return result
+
+
+def _compute_position_info(closes: list[float], turnovers: list[float]) -> dict:
+    """Compute price position context from closing prices and turnover rates.
+
+    Returns:
+        dist_60d_high_pct: distance from 60-day high (negative = below)
+        dist_60d_low_pct: distance from 60-day low (positive = above)
+        dist_120d_high_pct / dist_120d_low_pct: same for 120-day
+        ytd_pct: YTD return (approximation using available data)
+        turnover_5d / 10d / 20d: cumulative turnover over recent periods
+    """
+    if len(closes) < 3:
+        return {}
+
+    current = closes[-1]
+    info: dict = {}
+
+    # 60-day high/low distance
+    recent_60 = closes[-60:] if len(closes) >= 60 else closes
+    high_60 = max(recent_60)
+    low_60 = min(recent_60)
+    if high_60 > 0:
+        info["dist_60d_high_pct"] = round((current - high_60) / high_60 * 100, 1)
+    if low_60 > 0:
+        info["dist_60d_low_pct"] = round((current - low_60) / low_60 * 100, 1)
+
+    # 120-day high/low distance
+    if len(closes) >= 120:
+        recent_120 = closes[-120:]
+        high_120 = max(recent_120)
+        low_120 = min(recent_120)
+        if high_120 > 0:
+            info["dist_120d_high_pct"] = round((current - high_120) / high_120 * 100, 1)
+        if low_120 > 0:
+            info["dist_120d_low_pct"] = round((current - low_120) / low_120 * 100, 1)
+
+    # YTD approximation (use earliest available close)
+    if len(closes) >= 20:
+        ytd_base = closes[0]
+        if ytd_base > 0:
+            info["ytd_pct"] = round((current - ytd_base) / ytd_base * 100, 1)
+
+    # Cumulative turnover
+    if turnovers:
+        if len(turnovers) >= 5:
+            info["turnover_5d"] = round(sum(turnovers[-5:]), 2)
+        if len(turnovers) >= 10:
+            info["turnover_10d"] = round(sum(turnovers[-10:]), 2)
+        if len(turnovers) >= 20:
+            info["turnover_20d"] = round(sum(turnovers[-20:]), 2)
+
+    return info
+
+
+def _profile_to_dict(profile) -> dict | None:
+    """Convert StkProfile to a plain dict."""
+    if profile is None:
+        return None
+    return {
+        "board_type": profile.board_type,
+        "total_shares": profile.total_shares,
+        "liq_shares": profile.liq_shares,
+        "listing_date": profile.listing_date.isoformat() if profile.listing_date else None,
+    }
+
+
+def _lhb_to_dict(lhb) -> dict | None:
+    """Convert StkLhb to a plain dict."""
+    if lhb is None:
+        return None
+    return {
+        "reason": lhb.reason,
+        "net_buy": lhb.net_buy,
+        "buy_amount": lhb.buy_amount,
+        "sell_amount": lhb.sell_amount,
+    }
+
+
+def _margin_to_dict(margin) -> dict | None:
+    """Convert StkMargin to a plain dict."""
+    if margin is None:
+        return None
+    return {
+        "rzye": margin.rzye,
+        "rzjme": margin.rzjme,
+        "rqyl": margin.rqyl,
+        "rzrqye": margin.rzrqye,
+    }

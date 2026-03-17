@@ -24,8 +24,10 @@ class PriceLimits:
 class TradingPlan:
     entry_zone: tuple[float, float] | None  # (low, high); None when limit up/down
     stop_loss: float | None
-    targets: list[float] = field(default_factory=list)
+    targets: list[float] = field(default_factory=list)  # short-term (1-5 days)
     risk_reward: float = 0.0
+    mid_targets: list[float] = field(default_factory=list)  # mid-term (1-3 months)
+    mid_risk_reward: float = 0.0
     price_limits: PriceLimits = field(default_factory=lambda: PriceLimits(0, 0, 0))
     position_hint: str = "normal"  # aggressive / normal / conservative
     t1_note: str = ""
@@ -106,8 +108,8 @@ def _collect_key_levels(
         levels.append(_KeyLevel(prev.high, "prev_high", _pos(prev.high, close)))
         levels.append(_KeyLevel(prev.low, "prev_low", _pos(prev.low, close)))
 
-    # 20-day / 60-day high/low
-    for period in (20, 60):
+    # 20-day / 60-day / 120-day high/low
+    for period in (20, 60, 120):
         if len(bars) >= period:
             window = bars[-period:]
             high_n = max(b.high for b in window)
@@ -227,7 +229,7 @@ def _plan_bullish(
     stop_loss = max(stop_from_support, stop_from_atr, limits.down_limit)
     stop_loss = round(stop_loss, 2)
 
-    # Targets: first two resistance levels above close, capped at limit
+    # Short-term targets: first two resistance levels above close, capped at limit
     targets = []
     for r in resistances[:2]:
         t = min(r.price, limits.up_limit)
@@ -237,8 +239,10 @@ def _plan_bullish(
         targets.append(round(min(close + 1.5 * atr, limits.up_limit), 2))
     if len(targets) == 1:
         targets.append(round(min(close + 2.5 * atr, limits.up_limit), 2))
-    # Deduplicate
     targets = _dedup_targets(targets)
+
+    # Mid-term targets: longer-period levels (120d high, 60d high, MA60) + ATR fallback
+    mid_targets = _compute_mid_targets(close, atr, resistances)
 
     # Ensure stop loss has minimum distance from entry (avoid extreme R:R)
     entry_mid = (entry_low + entry_high) / 2
@@ -246,10 +250,14 @@ def _plan_bullish(
     if entry_mid - stop_loss < min_risk:
         stop_loss = round(max(entry_mid - min_risk, limits.down_limit), 2)
 
-    # Risk/reward
+    # Risk/reward (short-term)
     risk = entry_mid - stop_loss
     reward = targets[0] - entry_mid
     rr = _clamp_rr(round(reward / risk, 1) if risk > 0 else 0.0)
+
+    # Mid-term risk/reward
+    mid_reward = mid_targets[0] - entry_mid if mid_targets else 0.0
+    mid_rr = _clamp_rr(round(mid_reward / risk, 1) if risk > 0 and mid_reward > 0 else 0.0)
 
     # Position hint
     position_hint = _position_hint(rr)
@@ -271,6 +279,8 @@ def _plan_bullish(
         stop_loss=stop_loss,
         targets=targets,
         risk_reward=rr,
+        mid_targets=mid_targets,
+        mid_risk_reward=mid_rr,
         price_limits=limits,
         position_hint=position_hint,
         t1_note=t1_note,
@@ -350,6 +360,8 @@ def _plan_neutral(
         targets.append(round(min(close + 1.5 * atr, limits.up_limit), 2))
     targets = _dedup_targets(targets)
 
+    mid_targets = _compute_mid_targets(close, atr, resistances)
+
     entry_mid = (entry_low + entry_high) / 2
     min_risk = close * 0.015
     if entry_mid - stop_loss < min_risk:
@@ -359,11 +371,16 @@ def _plan_neutral(
     reward = targets[0] - entry_mid
     rr = _clamp_rr(round(reward / risk, 1) if risk > 0 else 0.0)
 
+    mid_reward = mid_targets[0] - entry_mid if mid_targets else 0.0
+    mid_rr = _clamp_rr(round(mid_reward / risk, 1) if risk > 0 and mid_reward > 0 else 0.0)
+
     return TradingPlan(
         entry_zone=(entry_low, entry_high),
         stop_loss=stop_loss,
         targets=targets,
         risk_reward=rr,
+        mid_targets=mid_targets,
+        mid_risk_reward=mid_rr,
         price_limits=limits,
         position_hint=_position_hint(rr),
         t1_note="T+1 提醒：方向不明确，轻仓或观望为宜",
@@ -387,6 +404,34 @@ def _position_hint(rr: float) -> str:
     return "conservative"
 
 
+def _compute_mid_targets(
+    close: float, atr: float, resistances: list[_KeyLevel],
+) -> list[float]:
+    """Compute mid-term targets (1-3 month horizon).
+
+    Prefers long-period levels (120d/60d highs, MA60) over short-period ones.
+    Falls back to ATR-based estimates (5x/8x ATR) when no long-period levels exist.
+    """
+    mid_sources = {"high_120d", "high_60d", "ma60"}
+    # Longer-period resistance levels, sorted by price
+    mid_levels = sorted(
+        [r for r in resistances if r.source in mid_sources and r.price > close * 1.03],
+        key=lambda x: x.price,
+    )
+
+    targets = []
+    for lv in mid_levels[:2]:
+        targets.append(round(lv.price, 2))
+
+    # Fallback: ATR-based mid-term targets
+    if len(targets) == 0:
+        targets.append(round(close + 5.0 * atr, 2))
+    if len(targets) == 1:
+        targets.append(round(close + 8.0 * atr, 2))
+
+    return _dedup_targets(targets)
+
+
 def _dedup_targets(targets: list[float]) -> list[float]:
     """Remove duplicate targets, keep order."""
     seen: set[float] = set()
@@ -405,6 +450,8 @@ def trading_plan_to_dict(plan: TradingPlan) -> dict:
         "stop_loss": plan.stop_loss,
         "targets": plan.targets,
         "risk_reward": plan.risk_reward,
+        "mid_targets": plan.mid_targets,
+        "mid_risk_reward": plan.mid_risk_reward,
         "price_limits": {
             "up": plan.price_limits.up_limit,
             "down": plan.price_limits.down_limit,

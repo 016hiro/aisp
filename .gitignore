@@ -22,6 +22,9 @@ wheels/
 *.db
 *.sqlite
 
+# Cache
+data/a_stock_codes.json
+
 # Briefings output
 briefings/
 

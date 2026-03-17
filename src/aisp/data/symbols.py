@@ -162,7 +162,8 @@ def add_symbol(section: str, key_field: str, key_value: str, fields: dict) -> bo
     entry = tomlkit.table()
     entry.add(key_field, key_value)
     for k, v in fields.items():
-        entry.add(k, v)
+        if k != key_field:
+            entry.add(k, v)
 
     if section not in doc:
         aot = tomlkit.aot()

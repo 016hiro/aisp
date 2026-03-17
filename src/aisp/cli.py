@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import date
 from pathlib import Path
 from typing import Annotated
@@ -215,6 +216,101 @@ def fetch_cn(
 
 
 @app.command()
+def fetch_extra(
+    trade_date: str | None = typer.Option(None, help="Date YYYY-MM-DD, default today"),
+    codes: str | None = typer.Option(None, help="Comma-separated stock codes (default: watchlist)"),
+):
+    """Fetch extended data: market sentiment + fund flow + LHB + margin."""
+    from aisp.data.market_data import (
+        fetch_fund_flow,
+        fetch_lhb,
+        fetch_margin,
+        fetch_market_sentiment,
+    )
+
+    dt = date.fromisoformat(trade_date) if trade_date else date.today()
+    code_list: list[str] | None = None
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        from aisp.data.symbols import load_cn_watchlist
+
+        wl = load_cn_watchlist()
+        code_list = [item["code"] for item in wl] if wl else None
+
+    async def _fetch():
+        console.print("[dim]Fetching market sentiment...[/dim]")
+        sent = await fetch_market_sentiment(dt)
+        console.print(f"[green]  Market sentiment: {sent} records[/green]")
+
+        if code_list:
+            console.print(f"[dim]Fetching fund flow ({len(code_list)} stocks)...[/dim]")
+            ff = await fetch_fund_flow(code_list)
+            console.print(f"[green]  Fund flow: {ff} records updated[/green]")
+
+            console.print(f"[dim]Fetching margin data ({len(code_list)} stocks)...[/dim]")
+            mg = await fetch_margin(code_list, dt)
+            console.print(f"[green]  Margin: {mg} records[/green]")
+
+        console.print("[dim]Fetching LHB...[/dim]")
+        lhb = await fetch_lhb(dt)
+        console.print(f"[green]  LHB: {lhb} records[/green]")
+
+    _run(_fetch())
+    console.print("[bold green]Extended data fetch complete.[/bold green]")
+
+
+@app.command()
+def fetch_profile(
+    codes: str | None = typer.Option(None, help="Comma-separated stock codes (default: watchlist)"),
+):
+    """Fetch stock profile data (board type, listing date). Run quarterly."""
+    from aisp.data.market_data import fetch_stk_profile
+
+    code_list: list[str] | None = None
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        from aisp.data.symbols import load_cn_watchlist
+
+        wl = load_cn_watchlist()
+        code_list = [item["code"] for item in wl] if wl else None
+
+    if not code_list:
+        console.print("[red]No codes to fetch profiles for.[/red]")
+        raise typer.Exit(1)
+
+    count = _run(fetch_stk_profile(code_list))
+    console.print(f"[green]Fetched {count} stock profiles.[/green]")
+
+
+@app.command()
+def fetch_quarterly(
+    year: int = typer.Argument(help="Year, e.g. 2025"),
+    quarter: int = typer.Argument(help="Quarter 1-4"),
+    codes: str | None = typer.Option(None, help="Comma-separated stock codes (default: watchlist)"),
+):
+    """Fetch quarterly financial data from BaoStock."""
+    from aisp.data.market_data import fetch_stk_quarterly
+
+    code_list: list[str] | None = None
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        from aisp.data.symbols import load_cn_watchlist
+
+        wl = load_cn_watchlist()
+        code_list = [item["code"] for item in wl] if wl else None
+
+    if not code_list:
+        console.print("[red]No codes to fetch quarterly data for.[/red]")
+        raise typer.Exit(1)
+
+    count = _run(fetch_stk_quarterly(code_list, year, quarter))
+    console.print(f"[green]Fetched {count} quarterly records (Q{quarter} {year}).[/green]")
+
+
+@app.command()
 def screen(
     trade_date: str | None = typer.Option(None, help="Date YYYY-MM-DD, default today"),
     codes: str | None = typer.Option(None, help="Comma-separated stock codes to display (default: all)"),
@@ -320,24 +416,36 @@ def run_analysis_pipeline(
         await _ensure_cn_data(dt, code_list)
         await _ensure_global_data(dt)
 
-        console.print("[bold]Step 1/3: Running sector screening...[/bold]")
+        # Fetch extended data (sentiment, fund flow, LHB)
+        console.print("[bold]Step 1/5: Fetching extended market data...[/bold]")
+        from aisp.data.market_data import fetch_fund_flow, fetch_lhb, fetch_market_sentiment
+
+        with contextlib.suppress(Exception):
+            await fetch_market_sentiment(dt)
+        if code_list:
+            with contextlib.suppress(Exception):
+                await fetch_fund_flow(code_list)
+        with contextlib.suppress(Exception):
+            await fetch_lhb(dt)
+
+        console.print("[bold]Step 2/5: Running sector screening...[/bold]")
         pool_mgr = SectorPoolManager()
         pools = await pool_mgr.update_pools(dt)
         scorer = StockScorer()
         await scorer.score_all_pools(pools, dt)
 
-        console.print("[bold]Step 2/3: Running LLM analysis...[/bold]")
+        console.print("[bold]Step 3/5: Running LLM analysis...[/bold]")
         count = await run_analysis(dt, codes=code_list)
         console.print(f"[dim]  Generated {count} signals[/dim]")
 
-        console.print("[bold]Step 3/4: Evaluating signal performance...[/bold]")
+        console.print("[bold]Step 4/5: Evaluating signal performance...[/bold]")
         from aisp.review.tracker import PerformanceTracker
 
         tracker = PerformanceTracker()
         eval_count = await tracker.evaluate_signals(dt)
         console.print(f"[dim]  Evaluated {eval_count} signals[/dim]")
 
-        console.print("[bold]Step 4/4: Generating briefing...[/bold]")
+        console.print("[bold]Step 5/5: Generating briefing...[/bold]")
         path = await generate_briefing(dt)
         return path
 
@@ -370,9 +478,27 @@ def dump_prompts(
 
     prompt_path = Path(output_dir) / str(dt)
 
-    async def _pipeline():
+    async def _pipeline() -> int:
         await _ensure_cn_data(dt, code_list)
         await _ensure_global_data(dt)
+
+        # Ensure extended data (sentiment, fund flow, LHB) for prompt enrichment
+        from aisp.data.market_data import fetch_fund_flow, fetch_lhb, fetch_market_sentiment
+
+        console.print("[dim]Fetching extended data (sentiment/fund flow/LHB)...[/dim]")
+        try:
+            await fetch_market_sentiment(dt)
+        except Exception as e:
+            console.print(f"[yellow]  Market sentiment fetch failed: {e}[/yellow]")
+        if code_list:
+            try:
+                await fetch_fund_flow(code_list)
+            except Exception as e:
+                console.print(f"[yellow]  Fund flow fetch failed: {e}[/yellow]")
+        try:
+            await fetch_lhb(dt)
+        except Exception as e:
+            console.print(f"[yellow]  LHB fetch failed: {e}[/yellow]")
 
         console.print("[bold]Step 1/2: Running sector screening...[/bold]")
         from aisp.screening.sector_pools import SectorPoolManager
@@ -384,10 +510,16 @@ def dump_prompts(
         await scorer.score_all_pools(pools, dt)
 
         console.print("[bold]Step 2/2: Dumping prompts...[/bold]")
-        await run_analysis(dt, codes=code_list, prompt_dir=prompt_path)
+        return await run_analysis(dt, codes=code_list, prompt_dir=prompt_path)
 
-    _run(_pipeline())
-    console.print(f"[bold green]Prompts saved to {prompt_path}/[/bold green]")
+    count = _run(_pipeline())
+    if count == 0 and not prompt_path.exists():
+        console.print(
+            f"[bold yellow]No prompts generated for {dt} "
+            f"(no scored stocks — is it a trading day?)[/bold yellow]"
+        )
+    else:
+        console.print(f"[bold green]Prompts saved to {prompt_path}/[/bold green]")
 
 
 @app.command()
@@ -430,7 +562,16 @@ def run_morning(
         if cn_date != dt:
             console.print(f"[dim]  Using latest CN data: {cn_date} (today's A-share not yet available)[/dim]")
 
-        console.print("[bold]Step 4/6: Running sector screening...[/bold]")
+        # Fetch extended data before screening
+        console.print("[bold]Step 4/7: Fetching extended market data...[/bold]")
+        from aisp.data.market_data import fetch_lhb, fetch_market_sentiment
+
+        with contextlib.suppress(Exception):
+            await fetch_market_sentiment(cn_date)
+        with contextlib.suppress(Exception):
+            await fetch_lhb(cn_date)
+
+        console.print("[bold]Step 5/7: Running sector screening...[/bold]")
         pool_mgr = SectorPoolManager()
         pools = await pool_mgr.update_pools(cn_date)
         scorer = StockScorer()
@@ -440,10 +581,10 @@ def run_morning(
         watchlist = load_cn_watchlist()
         wl_codes = [item["code"] for item in watchlist] if watchlist else None
 
-        console.print("[bold]Step 5/6: Running LLM analysis...[/bold]")
+        console.print("[bold]Step 6/7: Running LLM analysis...[/bold]")
         await run_analysis(cn_date, btc_metrics=btc_metrics, codes=wl_codes)
 
-        console.print("[bold]Step 6/6: Generating briefing...[/bold]")
+        console.print("[bold]Step 7/7: Generating briefing...[/bold]")
         path = await generate_briefing(cn_date, btc_metrics=btc_metrics)
         return path
 
@@ -469,14 +610,22 @@ def run_close(
         watchlist = load_cn_watchlist()
         code_list = [item["code"] for item in watchlist] if watchlist else None
         mode_label = f"watchlist ({len(code_list)} stocks)" if code_list else "full market"
-        console.print(f"[bold]Step 1/3: Fetching A-share data ({mode_label})...[/bold]")
+        console.print(f"[bold]Step 1/4: Fetching A-share data ({mode_label})...[/bold]")
         await fetch_cn_market(dt_parsed, codes=code_list)
 
-        console.print("[bold]Step 2/3: Updating sector pools...[/bold]")
+        # Fetch fund flow for watchlist stocks
+        if code_list:
+            console.print("[bold]Step 2/4: Fetching fund flow...[/bold]")
+            from aisp.data.market_data import fetch_fund_flow
+
+            with contextlib.suppress(Exception):
+                await fetch_fund_flow(code_list)
+
+        console.print("[bold]Step 3/4: Updating sector pools...[/bold]")
         pool_mgr = SectorPoolManager()
         await pool_mgr.update_pools(dt)
 
-        console.print("[bold]Step 3/3: Tracking performance...[/bold]")
+        console.print("[bold]Step 4/4: Tracking performance...[/bold]")
         tracker = PerformanceTracker()
         await tracker.evaluate_signals(dt)
 
@@ -810,6 +959,19 @@ def watch(
     messages = _run(handle_watch_query(query))
     for msg in messages:
         console.print(msg)
+
+
+@app.command()
+def refresh_codes():
+    """Refresh A-share stock code cache (name→code mapping from AkShare)."""
+    from aisp.watch_nlp import refresh_code_cache
+
+    console.print("[dim]正在从 AkShare 获取A股代码列表...[/dim]")
+    try:
+        count = refresh_code_cache()
+        console.print(f"[green]缓存已更新: {count} 只股票[/green]")
+    except Exception as e:
+        console.print(f"[red]缓存更新失败: {e}[/red]")
 
 
 # ── Symbol management (structured) ───────────────────────

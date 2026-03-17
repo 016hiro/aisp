@@ -114,7 +114,9 @@ def _create_agent():
     return create_deep_agent(
         model=_create_llm(),
         tools=AGENT_TOOLS,
-        system_prompt=get_template("agent_system"),
+        system_prompt=get_template("agent_system").format(
+            output_schema=get_template("output_schema"),
+        ),
     )
 
 

@@ -48,6 +48,9 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests hitting real external APIs (deselect with '-m not e2e')",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aisp"]

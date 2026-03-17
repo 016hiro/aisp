@@ -9,6 +9,7 @@
 ## 核心能力
 
 - **全球数据整合**：美股指数/个股（yfinance）、大宗商品、BTC 风险偏好、A 股行情（BaoStock TCP）、行业板块（AkShare THS）
+- **扩展市场数据**：市场情绪温度（涨停/跌停/炸板率）、个股资金分层（超大单/大单/中单/小单）、龙虎榜、融资融券、PE/PB 估值、股本结构、季度财报
 - **三池板块管理**：核心池（长期关注）、冲锋池（短期热点）、机会池（超跌反弹）动态轮转
 - **多层量化选股**：8 因子弹性权重评分 → 威科夫阶段校准 → 突破信号检测 → 交易计划生成 → 方向护栏
 - **Deep Agent 分析**：LangChain Deep Agents 框架，可主动搜索新闻/宏观事件（DuckDuckGo），结合量化因子给出判断
@@ -61,6 +62,7 @@ AISP_OPENROUTER__SENTIMENT_MODEL=google/gemini-2.0-flash-001
 | 本地 LLM | `AISP_LOCAL_LLM__*` | 局域网模型优先路由（情感/NLP/OCR） |
 | OCR 模型 | `AISP_OCR__*` | 默认 `google/gemini-3.1-flash-lite-preview` |
 | Telegram | `AISP_TELEGRAM__*` | Bot Token + 授权用户 |
+| 资产关联 | `AISP_ASSET_LINKAGE__*` | 全球资产→A 股板块映射（过滤 prompt 全球数据） |
 | 搜索代理 | `AISP_SEARCH_PROXY` | DuckDuckGo 搜索代理 |
 
 > **本地 LLM 路由**：情感分类、Watchlist NLP、OCR 优先走本地，失败后回退远程 OpenRouter。Deep Agent 始终走远程。熔断器：本地失败后 30s 内跳过。
@@ -95,9 +97,12 @@ uv run aisp fetch-commodities         # 采集大宗商品
 uv run aisp fetch-cn                  # 采集 A 股行情（默认自选股）
 uv run aisp fetch-cn --mode full      # 全量采集（~5000 只）
 uv run aisp fetch-cn --mode codes --codes 600519,000858  # 指定股票
+uv run aisp fetch-extra               # 市场情绪 + 资金分层 + 龙虎榜 + 融资融券
+uv run aisp fetch-profile             # 股本结构（季度运行）
+uv run aisp fetch-quarterly 2025 4    # 季度财报（指定年份+季度）
 ```
 
-A 股个股通过 BaoStock（TCP 协议，不受 HTTP 代理影响），板块数据通过 AkShare THS 源（90 个同花顺行业板块）。
+A 股个股通过 BaoStock（TCP 协议，不受 HTTP 代理影响），板块数据通过 AkShare THS 源（90 个同花顺行业板块）。PE/PB 估值随日线行情自动采集。
 
 #### 分析流水线
 
@@ -240,6 +245,21 @@ uv run aisp dump-prompts --codes 002709 -o prompts/  # 指定股票
 
 个股分析采用 LangChain Deep Agents，Agent 可主动搜索个股新闻、板块动态、宏观事件（DuckDuckGo），结合量化因子给出结构化判断（direction / confidence / reasoning / risks / catalysts）。
 
+**方法论驱动的 Agent Prompt**（`config/prompts.toml`）：
+
+- **因子解读参考**：每个因子分数附 5 档中文标签（如资金面：主力大幅流出/偏弱/中性/偏强/主力大幅流入），`format_factor_table()` 生成结构化表格
+- **K 线历史**：近 15 根 OHLCV 传入 LLM，附趋势摘要（连跌天数、累计跌幅、MA5 vs MA20），由 `format_kline_history()` / `format_trend_summary()` 格式化
+- **市场情绪**：涨停/跌停/炸板率/连板高度/昨涨停溢价，由 `format_market_sentiment()` 格式化
+- **价格位置**：距 60/120 日高低点百分比、YTD 涨跌幅、累计换手率，由 `format_position_info()` 格式化
+- **资金分层**：超大单/大单/中单/小单净额和占比，由 `format_fund_flow_detail()` 格式化
+- **龙虎榜**：净买入额和上榜原因（条件显示），由 `format_lhb_info()` 格式化
+- **股票身份**：板块类型/流通市值/PE(TTM)/PB，由 `format_stock_identity()` 格式化
+- **全球数据按需过滤**：通过 `AssetLinkageConfig` 仅展示与当前板块关联的全球资产，而非全部 10+ 品种
+- **JSON Schema 抽取**：输出格式定义提取到 `[output_schema]` 单独节，消除原先 3 处重复
+- **系统提示词结构**：因子解读参考 → 4 步分析方法论 → 搜索触发条件 → 交易计划验证规则 → 输出纪律（禁用话术、要求数据佐证）
+
+`stock_scorer.py` 向下游暴露 `_recent_ohlcv`（近 15 根 K 线）、`_raw_indicators`（RSI6、MACD 原始值）、`_position_info`（价格位置）、`_profile`（股票身份）、`_lhb`（龙虎榜）、`_margin`（融资融券），供 prompt 组装使用。
+
 LLM 返回后自动执行**方向护栏**：
 - R:R < 1.0 的看多信号自动降级（BUY → WEAK_BUY → HOLD）
 - 连续 3+ 天下跌且累计 >5% 且 MA5 < MA20 → 强制 HOLD
@@ -270,19 +290,20 @@ src/aisp/
 ├── tui.py                 # TUI 简报浏览器 (Textual)
 ├── watch_nlp.py           # 自然语言观察列表管理
 ├── db/
-│   ├── models.py          # 13 张 SQLAlchemy 表
-│   └── engine.py          # 异步数据库引擎
+│   ├── models.py          # 18 张 SQLAlchemy 表
+│   └── engine.py          # 异步数据库引擎 + 迁移
 ├── data/
 │   ├── us_market.py       # 美股数据采集
 │   ├── commodities.py     # 大宗商品采集
-│   ├── cn_market.py       # A 股数据采集 (BaoStock TCP)
+│   ├── cn_market.py       # A 股数据采集 (BaoStock TCP) + PE/PB
+│   ├── market_data.py     # 扩展数据：情绪/资金分层/龙虎榜/融资融券/股本/季报
 │   ├── btc_risk.py        # BTC 风险偏好指标
 │   ├── symbols.py         # 标的配置 (symbols.toml)
 │   ├── calendar.py        # 交易日历管理
 │   └── sources/           # 舆情适配器 (@register_adapter)
 ├── screening/
 │   ├── sector_pools.py    # 三池板块管理
-│   ├── stock_scorer.py    # 8 因子评分 + 校准编排
+│   ├── stock_scorer.py    # 8 因子评分 + 校准编排 + K线/指标透传
 │   ├── factor_engine.py   # 弹性权重引擎 + 否决规则
 │   ├── indicators.py      # RSI/MACD/均线 纯函数
 │   ├── wyckoff.py         # 威科夫阶段检测
@@ -292,7 +313,7 @@ src/aisp/
 │   ├── llm_client.py      # OpenRouter 客户端 + 本地 LLM 路由
 │   ├── analyzer.py        # LLM 分析编排 + 方向护栏
 │   ├── agent.py           # Deep Agent + 搜索工具
-│   ├── prompts.py         # Prompt 加载器
+│   ├── prompts.py         # Prompt 加载器 + 因子表/K线/趋势/情绪/资金/位置格式化
 │   └── signals.py         # 信号生成与退出逻辑
 ├── portfolio/
 │   ├── ocr.py             # LLM 多模态 OCR
@@ -307,11 +328,11 @@ src/aisp/
     └── briefing.py        # Markdown 简报生成
 ```
 
-### 数据库表（13 张）
+### 数据库表（18 张）
 
 | 表名 | 用途 | 唯一约束 |
 |------|------|----------|
-| `stk_daily` | A 股日线行情 | `(trade_date, code)` |
+| `stk_daily` | A 股日线行情 + 资金分层 + PE/PB | `(trade_date, code)` |
 | `global_daily` | 美股/指数/商品行情 | `(trade_date, symbol)` |
 | `stk_sector_map` | 股票-板块映射（THS 行业） | `(code, sector_name, source)` |
 | `sector_daily` | 板块日线（THS 90 行业板块） | `(trade_date, sector_name)` |
@@ -324,6 +345,11 @@ src/aisp/
 | `position_snapshot` | 持仓快照 | `(snapshot_date, code)` |
 | `trade_record` | 交割单/成交记录 | `(trade_date, code, direction, price, qty)` |
 | `image_hash` | 图片去重（Telegram） | `hash` |
+| `market_sentiment` | 全市场情绪指标 | `trade_date` |
+| `stk_profile` | 股本结构（板块/流通股/上市日期） | `code` |
+| `stk_quarterly` | 季度财报（利润/ROE/增长率） | `(code, year, quarter)` |
+| `stk_lhb` | 龙虎榜明细 | `(trade_date, code)` |
+| `stk_margin` | 融资融券余额 | `(trade_date, code)` |
 
 所有写入使用 SQLite upsert 保证幂等性，批量插入 500 行分块，全异步（aiosqlite + greenlet）。
 
