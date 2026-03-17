@@ -28,6 +28,9 @@ data/a_stock_codes.json
 # Briefings output
 briefings/
 
+# Prompt dumps
+prompts/
+
 # OS
 .DS_Store
 Thumbs.db
