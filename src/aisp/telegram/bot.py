@@ -368,6 +368,18 @@ def _clear_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Application builder ──────────────────────────────
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler — downgrade transient network errors to WARNING."""
+    from telegram.error import NetworkError, TimedOut
+
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("Transient network error (will retry): %s", err)
+        return
+
+    logger.error("Unhandled exception", exc_info=context.error)
+
+
 def create_application() -> Application:
     """Build and return the Telegram Application (not yet running)."""
     settings = get_settings()
@@ -415,6 +427,7 @@ def create_application() -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", _start, filters=user_filter))
     app.add_handler(conv_handler)
+    app.add_error_handler(_error_handler)
 
     return app
 

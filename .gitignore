@@ -35,4 +35,5 @@ prompts/
 .DS_Store
 Thumbs.db
 logs/
+data/logs/
 config/ths_scrape_progress.json
